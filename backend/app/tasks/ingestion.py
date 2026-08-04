@@ -25,6 +25,11 @@ async def _process(document_id: str) -> dict:
     progress = get_ingestion_progress_service()
     doc_uuid = UUID(document_id)
 
+    # A revoked acks_late task may be redelivered; stop before doing any work.
+    if await progress.is_cancelled(document_id):
+        logger.info("Ingestion already cancelled, skipping document_id=%s", document_id)
+        return {"document_id": document_id, "status": "cancelled"}
+
     async def on_stage(node_name: str) -> None:
         await progress.report_stage(document_id, node_name)
 

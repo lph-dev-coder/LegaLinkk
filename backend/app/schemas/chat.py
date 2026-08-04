@@ -44,7 +44,14 @@ class ChatQueryRequest(BaseModel):
 class ChatJobCreateRequest(ChatQueryRequest):
     """Start a reconnectable background chat or specialist-agent generation."""
 
-    mode: Literal["chat", "agent"] = "chat"
+    mode: Literal["chat", "agent", "report"] = "chat"
+    conversation_id: UUID | None = Field(
+        default=None,
+        description=(
+            "Attach this turn to an existing SQL-persisted conversation. When "
+            "omitted, a new conversation is created and its id is returned."
+        ),
+    )
 
 
 class ChatJobCreateResponse(BaseModel):
@@ -52,15 +59,19 @@ class ChatJobCreateResponse(BaseModel):
 
     job_id: UUID
     status: Literal["queued"]
+    conversation_id: UUID
 
 
 class ChatJobStatusResponse(BaseModel):
     """Current durable status used when restoring the Consultation page."""
 
     job_id: UUID
-    mode: Literal["chat", "agent"]
-    status: Literal["queued", "processing", "completed", "failed"]
+    mode: Literal["chat", "agent", "report"]
+    status: Literal["queued", "processing", "completed", "failed", "cancelled"]
     event_count: int
+    # ISO-8601 queue time; lets the UI resume the elapsed timer from the real
+    # start after a refresh instead of restarting it at zero.
+    created_at: str | None = None
 
 
 class ChatSource(BaseModel):

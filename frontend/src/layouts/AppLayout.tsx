@@ -41,6 +41,15 @@ export function ConsultationLayout() {
   return <AppShell title="Nouvelle consultation" subtitle="Votre assistant juridique" />
 }
 
+export function ComparisonsLayout() {
+  return (
+    <AppShell
+      title="Comparaison de contrats"
+      subtitle="Diff sémantique clause par clause et impact sur le risque"
+    />
+  )
+}
+
 export function DocumentsLayout() {
   return <AppShell title="Mes contrats" subtitle="Vos contrats déposés et leurs analyses" />
 }
@@ -50,6 +59,15 @@ export function GeneratedDocumentsLayout() {
     <AppShell
       title="Documents générés"
       subtitle="Vos rapports et exports PDF"
+    />
+  )
+}
+
+export function TasksLayout() {
+  return (
+    <AppShell
+      title="Tâches"
+      subtitle="Traitements en cours et récemment terminés"
     />
   )
 }

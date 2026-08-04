@@ -95,10 +95,20 @@ class DocumentService:
             document.status.value,
         )
 
-        task_id = await self._enqueue_processing(document.id)
+        task_id = await self._enqueue_processing(
+            document.id,
+            user_id=user_id,
+            title=original_filename,
+        )
         return UploadResult(document=document, task_id=task_id)
 
-    async def _enqueue_processing(self, document_id: UUID) -> str | None:
+    async def _enqueue_processing(
+        self,
+        document_id: UUID,
+        *,
+        user_id: UUID,
+        title: str,
+    ) -> str | None:
         """Queue the ingestion task and seed the progress store (best-effort)."""
         # Imported lazily to keep Celery/Redis optional at import time.
         from app.tasks.ingestion import process_document_task
@@ -109,11 +119,22 @@ class DocumentService:
                 process_document_task.delay, doc_id
             )
             task_id = async_result.id
-            await self._progress.mark_queued(doc_id, task_id)
+            await self._progress.mark_queued(
+                doc_id,
+                task_id,
+                user_id=str(user_id),
+                title=title,
+            )
             logger.info("Ingestion queued document_id=%s task_id=%s", doc_id, task_id)
             return task_id
         except Exception:
             logger.exception("Failed to enqueue ingestion for document_id=%s", doc_id)
+            await self._progress.mark_queued(
+                doc_id,
+                None,
+                user_id=str(user_id),
+                title=title,
+            )
             await self._progress.mark_failed(
                 doc_id, "Could not queue processing. Please retry."
             )
@@ -124,7 +145,11 @@ class DocumentService:
     ) -> UploadResult:
         """Re-queue background processing for an existing document."""
         document = await self.get_document(document_id, user_id=user_id)
-        task_id = await self._enqueue_processing(document.id)
+        task_id = await self._enqueue_processing(
+            document.id,
+            user_id=user_id,
+            title=document.original_filename,
+        )
         return UploadResult(document=document, task_id=task_id)
 
     async def get_progress(self, document_id: UUID, *, user_id: UUID) -> dict:

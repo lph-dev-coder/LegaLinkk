@@ -8,6 +8,7 @@ of truth), updates the state and returns it. No business logic lives here.
 from app.agents.nodes.chunking_node import ChunkingNode
 from app.agents.nodes.cleaning_node import CleaningNode
 from app.agents.nodes.command_parser_node import CommandParserNode
+from app.agents.nodes.comparison_node import ComparisonNode
 from app.agents.nodes.compliance_node import ComplianceNode
 from app.agents.nodes.embedding_node import EmbeddingNode
 from app.agents.nodes.finance_node import FinanceNode
@@ -33,6 +34,7 @@ __all__ = [
     "GeneratorNode",
     # Multi-agent graph nodes
     "CommandParserNode",
+    "ComparisonNode",
     "LegalNode",
     "FinanceNode",
     "ComplianceNode",

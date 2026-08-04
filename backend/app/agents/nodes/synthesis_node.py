@@ -101,11 +101,48 @@ class SynthesisNode(BaseGraphAgent):
             len(available),
             len(_INPUTS),
         )
+        llm = self._get_llm()
+        max_tokens = self._settings.synthesis_max_tokens
         try:
-            completion = await self._get_llm().complete(
-                messages, temperature=self._settings.llm_temperature
+            completion = await llm.complete(
+                messages,
+                temperature=self._settings.llm_temperature,
+                max_tokens=max_tokens,
             )
-            recommendation = (completion.content or "").strip()
+            parts = [completion.content or ""]
+            finish_reason = completion.finish_reason
+            total_tokens = completion.total_tokens or 0
+
+            # Continue where the model stopped if it hit the token ceiling, so a
+            # long cross-disciplinary recommendation is never cut off mid-section.
+            rounds = 0
+            while (
+                finish_reason == "length"
+                and rounds < self._settings.synthesis_max_continuations
+            ):
+                rounds += 1
+                logger.info("[multi_agent] synthesis continuation round=%s", rounds)
+                continuation = await llm.complete(
+                    [
+                        *messages,
+                        {"role": "assistant", "content": "".join(parts)},
+                        {
+                            "role": "user",
+                            "content": (
+                                "Continue la recommandation exactement là où tu "
+                                "t'es arrêté, sans rien répéter ni réintroduire."
+                            ),
+                        },
+                    ],
+                    temperature=self._settings.llm_temperature,
+                    max_tokens=max_tokens,
+                )
+                parts.append(continuation.content or "")
+                finish_reason = continuation.finish_reason
+                total_tokens += continuation.total_tokens or 0
+                completion = continuation
+
+            recommendation = "".join(parts).strip()
         except Exception as exc:
             logger.exception("[multi_agent] synthesis generation failed")
             message = (
@@ -116,14 +153,24 @@ class SynthesisNode(BaseGraphAgent):
             state["final_recommendation"] = message
             return state
 
+        truncated = finish_reason == "length"
+        if truncated:
+            logger.warning("[multi_agent] synthesis still truncated after continuations")
+            recommendation = (
+                recommendation
+                + "\n\n_(La synthèse a été raccourcie pour rester dans les limites "
+                "de génération. Régénérez-la si besoin de plus de détail.)_"
+            )
+
         state["final_recommendation"] = recommendation or (
             "La synthèse n'a pas pu être générée."
         )
         metadata = ensure_metadata(state)
         metadata["synthesis"] = {
-            "provider": self._get_llm().provider_name,
+            "provider": llm.provider_name,
             "model": completion.model,
-            "tokens_used": completion.total_tokens,
+            "tokens_used": total_tokens,
+            "truncated": truncated,
             "inputs_used": [label for label, _ in available],
         }
         return state

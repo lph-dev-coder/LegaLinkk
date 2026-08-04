@@ -7,10 +7,12 @@ from app.api.v1.endpoints import (
     agents,
     auth,
     chat,
+    comparisons,
     documents,
     generated_documents,
     health,
     retrieval,
+    tasks,
 )
 
 api_router = APIRouter()
@@ -25,4 +27,6 @@ api_router.include_router(documents.router, dependencies=_protected)
 api_router.include_router(generated_documents.router, dependencies=_protected)
 api_router.include_router(retrieval.router, dependencies=_protected)
 api_router.include_router(chat.router, dependencies=_protected)
+api_router.include_router(comparisons.router, dependencies=_protected)
 api_router.include_router(agents.router, dependencies=_protected)
+api_router.include_router(tasks.router, dependencies=_protected)

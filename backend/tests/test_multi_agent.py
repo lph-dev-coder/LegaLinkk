@@ -42,6 +42,15 @@ async def test_command_parser_command_without_text_uses_default_question() -> No
     result = await CommandParserNode().execute({"user_query": "/legal"})
     assert result["target_agent"] == "legal"
     assert result["user_query"]  # non-empty fallback question
+    assert result["metadata"]["is_default_question"] is True
+
+
+async def test_command_parser_with_text_is_not_default_question() -> None:
+    result = await CommandParserNode().execute(
+        {"user_query": "/finance quel est le plafond de responsabilité ?"}
+    )
+    assert result["target_agent"] == "finance"
+    assert result["metadata"]["is_default_question"] is False
 
 
 async def test_command_parser_without_command_runs_all() -> None:
@@ -50,6 +59,7 @@ async def test_command_parser_without_command_runs_all() -> None:
     )
     assert result["target_agent"] is None
     assert result["user_query"] == "Quel est le délai de paiement ?"
+    assert result["metadata"]["is_default_question"] is False
 
 
 async def test_command_parser_ignores_mid_message_slash() -> None:

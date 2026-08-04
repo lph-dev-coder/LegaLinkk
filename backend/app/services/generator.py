@@ -78,6 +78,154 @@ class GeneratorService:
             self._llm = get_llm_provider(self._settings)
         return self._llm
 
+    @staticmethod
+    def _document_system(report_focus: str | None) -> str:
+        """Combine an optional per-domain report focus with the shared document
+        instructions.
+
+        The focus only sets the analytical lens (juridique / financier /
+        conformité / synthèse) used by the specialist-agent PDF reports; the
+        HTML format and the reproducible-scoring method stay in
+        ``DOCUMENT_SYSTEM_INSTRUCTIONS`` (single source of truth). The focus text
+        MUST be free of ``{``/``}`` because the combined prompt is later run
+        through ``str.format(no_answer=...)``.
+        """
+        if report_focus and report_focus.strip():
+            return f"{report_focus.strip()}\n\n{DOCUMENT_SYSTEM_INSTRUCTIONS}"
+        return DOCUMENT_SYSTEM_INSTRUCTIONS
+
+    @staticmethod
+    def _coerce_document_id(document_id: UUID | str | None) -> UUID | None:
+        if document_id is None or document_id == "":
+            return None
+        return document_id if isinstance(document_id, UUID) else UUID(str(document_id))
+
+    async def _resolve_answer_chunks(
+        self,
+        question: str,
+        *,
+        user_id: UUID,
+        document_id: UUID | str | None = None,
+        top_k: int | None = None,
+        final_k: int | None = None,
+        is_default_question: bool = False,
+    ) -> tuple[list[Any], dict[str, Any]]:
+        """Pick Top-K or full-document chunks for an answer (single decision point).
+
+        * Full-document: ``document_id`` is set **and** ``is_default_question`` is
+          True (bare ``/finance`` / ``/legal`` / ``/compliance``, or an explicit
+          global analysis). Loads every chunk via
+          :meth:`RetrievalService.get_document_chunks`. ``top_k`` / ``final_k``
+          are ignored. If the document exceeds
+          ``agent_full_document_max_chars``, falls back to Top-K with an
+          elevated ``final_k`` so LLM cost stays bounded.
+        * Top-K: free-form user questions, or no ``document_id``. Uses the
+          existing embed → retrieve → rerank pipeline.
+        """
+        doc_id = self._coerce_document_id(document_id)
+        want_full = doc_id is not None and bool(is_default_question)
+
+        if want_full and doc_id is not None:
+            chunks = await self._retrieval.get_document_chunks(
+                doc_id, user_id=user_id
+            )
+            total_chars = sum(len(getattr(c, "text", "") or "") for c in chunks)
+            soft_cap = self._settings.agent_full_document_max_chars
+            if total_chars > soft_cap:
+                fallback_k = max(
+                    final_k or self._settings.reranker_final_k,
+                    self._settings.agent_full_document_fallback_final_k,
+                )
+                logger.warning(
+                    "Full-document too large chars=%s cap=%s — "
+                    "falling back to Top-K final_k=%s document_id=%s",
+                    total_chars,
+                    soft_cap,
+                    fallback_k,
+                    doc_id,
+                )
+                ranked, candidate_k, keep_k = await self._retrieve_and_rerank(
+                    question,
+                    user_id=user_id,
+                    top_k=top_k,
+                    final_k=fallback_k,
+                    document_id=doc_id,
+                )
+                available = sum(
+                    len(getattr(c, "text", "") or "") for c in ranked
+                )
+                meta = {
+                    "retrieval_mode": "top_k_fallback",
+                    "requested_mode": "full_document",
+                    "context_chunks": len(ranked),
+                    "context_chars_available": available,
+                    "document_chars": total_chars,
+                    "top_k": candidate_k,
+                    "final_k": keep_k,
+                    "max_chars_budget": self._settings.rag_max_context_chars,
+                }
+                logger.info(
+                    "Retrieval mode=%s chunks=%s chars_available=%s "
+                    "document_chars=%s document_id=%s",
+                    meta["retrieval_mode"],
+                    meta["context_chunks"],
+                    meta["context_chars_available"],
+                    total_chars,
+                    doc_id,
+                )
+                return ranked, meta
+
+            meta = {
+                "retrieval_mode": "full_document",
+                "requested_mode": "full_document",
+                "context_chunks": len(chunks),
+                "context_chars_available": total_chars,
+                "document_chars": total_chars,
+                "top_k": None,
+                "final_k": None,
+                "max_chars_budget": self._settings.full_document_context_chars,
+            }
+            logger.info(
+                "Retrieval mode=%s chunks=%s chars_available=%s "
+                "budget=%s document_id=%s",
+                meta["retrieval_mode"],
+                meta["context_chunks"],
+                meta["context_chars_available"],
+                meta["max_chars_budget"],
+                doc_id,
+            )
+            return chunks, meta
+
+        ranked, candidate_k, keep_k = await self._retrieve_and_rerank(
+            question,
+            user_id=user_id,
+            top_k=top_k,
+            final_k=final_k,
+            document_id=doc_id,
+        )
+        available = sum(len(getattr(c, "text", "") or "") for c in ranked)
+        meta = {
+            "retrieval_mode": "top_k",
+            "requested_mode": "top_k",
+            "context_chunks": len(ranked),
+            "context_chars_available": available,
+            "document_chars": available,
+            "top_k": candidate_k,
+            "final_k": keep_k,
+            "max_chars_budget": self._settings.rag_max_context_chars,
+        }
+        logger.info(
+            "Retrieval mode=%s chunks=%s chars_available=%s "
+            "top_k=%s final_k=%s document_id=%s",
+            meta["retrieval_mode"],
+            meta["context_chunks"],
+            meta["context_chars_available"],
+            candidate_k,
+            keep_k,
+            doc_id,
+        )
+        return ranked, meta
+
     async def answer_question(
         self,
         question: str,
@@ -87,29 +235,34 @@ class GeneratorService:
         final_k: int | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
-        document_id: UUID | None = None,
+        document_id: UUID | str | None = None,
         history: Sequence[dict[str, str]] | None = None,
         system_prompt: str | None = None,
+        is_default_question: bool = False,
     ) -> dict[str, Any]:
-        """Full RAG pipeline: embed → retrieve → rerank → LLM."""
+        """Grounded answer: Top-K RAG, or full-document when flagged as default."""
         cleaned = (question or "").strip()
         if not cleaned:
             raise ValidationError("Question must not be empty")
 
         logger.info(
-            "Question received chars=%s document_id=%s history_turns=%s",
+            "Question received chars=%s document_id=%s "
+            "is_default_question=%s history_turns=%s",
             len(cleaned),
             document_id,
+            is_default_question,
             len(history or []),
         )
         started = time.perf_counter()
-        ranked, candidate_k, keep_k = await self._retrieve_and_rerank(
+        ranked, retrieval_meta = await self._resolve_answer_chunks(
             cleaned,
             user_id=user_id,
+            document_id=document_id,
             top_k=top_k,
             final_k=final_k,
-            document_id=document_id,
+            is_default_question=is_default_question,
         )
+        max_chars = retrieval_meta.get("max_chars_budget")
 
         result = await self.generate_from_chunks(
             cleaned,
@@ -118,12 +271,25 @@ class GeneratorService:
             max_tokens=max_tokens,
             history=history,
             system_prompt=system_prompt,
+            max_chars=max_chars,
         )
-        result["metadata"]["top_k"] = candidate_k
-        result["metadata"]["final_k"] = keep_k
+        # Preserve post-merge counts from generate_from_chunks; retrieval_meta
+        # carries the pre-merge pool size under distinct keys.
+        chunks_sent = result["metadata"].get("context_chunks")
+        result["metadata"].update(retrieval_meta)
+        result["metadata"]["context_chunks"] = chunks_sent
+        result["metadata"]["context_chars_sent"] = len(
+            result.get("context_text") or ""
+        )
         result["metadata"]["history_turns"] = len(history or [])
         result["metadata"]["generation_time"] = round(
             time.perf_counter() - started, 3
+        )
+        logger.info(
+            "Answer ready retrieval_mode=%s chunks_sent=%s chars_sent=%s",
+            retrieval_meta.get("retrieval_mode"),
+            result["metadata"].get("context_chunks"),
+            result["metadata"]["context_chars_sent"],
         )
         return result
 
@@ -246,15 +412,16 @@ class GeneratorService:
         final_k: int | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
-        document_id: UUID | None = None,
+        document_id: UUID | str | None = None,
         history: Sequence[dict[str, str]] | None = None,
         system_prompt: str | None = None,
+        is_default_question: bool = False,
     ) -> AsyncIterator[dict[str, Any]]:
         """Stream a grounded answer as it is generated.
 
-        Reuses the same retrieval/rerank/prompt logic as ``answer_question`` and
-        yields events: ``{"type": "sources", ...}``, then incremental
-        ``{"type": "delta", "text": ...}``, and finally
+        Reuses the same retrieval decision as ``answer_question`` (Top-K vs
+        full-document) and yields events: ``{"type": "sources", ...}``, then
+        incremental ``{"type": "delta", "text": ...}``, and finally
         ``{"type": "done", "metadata": ...}``.
         """
         cleaned = (question or "").strip()
@@ -262,23 +429,32 @@ class GeneratorService:
             raise ValidationError("Question must not be empty")
 
         logger.info(
-            "Question received (stream) chars=%s document_id=%s history_turns=%s",
+            "Question received (stream) chars=%s document_id=%s "
+            "is_default_question=%s history_turns=%s",
             len(cleaned),
             document_id,
+            is_default_question,
             len(history or []),
         )
         started = time.perf_counter()
         no_answer = self._prompt_builder.no_answer_message
-        ranked, candidate_k, keep_k = await self._retrieve_and_rerank(
+        ranked, retrieval_meta = await self._resolve_answer_chunks(
             cleaned,
             user_id=user_id,
+            document_id=document_id,
             top_k=top_k,
             final_k=final_k,
-            document_id=document_id,
+            is_default_question=is_default_question,
         )
-        prompt, sources, _context_text, used_chunks = self._prepare_prompt(
-            cleaned, ranked, history=history, system_prompt=system_prompt
+        prompt, sources, context_text, used_chunks = self._prepare_prompt(
+            cleaned,
+            ranked,
+            history=history,
+            system_prompt=system_prompt,
+            max_chars=retrieval_meta.get("max_chars_budget"),
         )
+        candidate_k = retrieval_meta.get("top_k")
+        keep_k = retrieval_meta.get("final_k")
 
         yield {"type": "sources", "sources": sources}
 
@@ -340,10 +516,14 @@ class GeneratorService:
 
         elapsed = round(time.perf_counter() - started, 3)
         logger.info(
-            "Streaming completed provider=%s model=%s chars=%s elapsed=%ss",
+            "Streaming completed provider=%s model=%s chars=%s "
+            "retrieval_mode=%s chunks_sent=%s chars_sent=%s elapsed=%ss",
             llm.provider_name,
             llm.model,
             len(answer),
+            retrieval_meta.get("retrieval_mode"),
+            len(used_chunks),
+            len(context_text or ""),
             elapsed,
         )
         yield {
@@ -356,10 +536,21 @@ class GeneratorService:
                 "model": llm.model,
                 "generation_time": elapsed,
                 "context_chunks": len(used_chunks),
+                "context_chars_sent": len(context_text or ""),
                 "history_turns": len(history or []),
                 "top_k": candidate_k,
                 "final_k": keep_k,
                 "answer_chars": len(answer),
+                **{
+                    k: v
+                    for k, v in retrieval_meta.items()
+                    if k
+                    not in {
+                        "context_chunks",
+                        "top_k",
+                        "final_k",
+                    }
+                },
             },
         }
 
@@ -372,10 +563,13 @@ class GeneratorService:
         max_tokens: int | None = None,
         history: Sequence[dict[str, str]] | None = None,
         system_prompt: str | None = None,
+        max_chars: int | None = None,
     ) -> dict[str, Any]:
         """Generate a grounded answer from already selected chunks.
 
         Intended for reuse by future agents that bring their own context.
+        ``max_chars`` overrides the default RAG context window (used by
+        full-document agent analyses so the whole contract fits).
         """
         cleaned = (question or "").strip()
         if not cleaned:
@@ -384,7 +578,11 @@ class GeneratorService:
         started = time.perf_counter()
         no_answer = self._prompt_builder.no_answer_message
         prompt, sources, context_text, used_chunks = self._prepare_prompt(
-            cleaned, chunks, history=history, system_prompt=system_prompt
+            cleaned,
+            chunks,
+            history=history,
+            system_prompt=system_prompt,
+            max_chars=max_chars,
         )
 
         if prompt is None:
@@ -591,6 +789,7 @@ class GeneratorService:
         document_id: UUID | None = None,
         history: Sequence[dict[str, str]] | None = None,
         full_document: bool | None = None,
+        report_focus: str | None = None,
     ) -> dict[str, Any]:
         """Generate a grounded, self-contained HTML document (printable to PDF).
 
@@ -611,6 +810,11 @@ class GeneratorService:
 
         The Q&A endpoints (``/chat/query``, ``/chat/stream``) never call this;
         they stay purely similarity-based on the user's question.
+
+        ``report_focus`` optionally prepends a specialist lens (juridique /
+        financier / conformité / synthèse) so a ``/legal``, ``/finance``,
+        ``/compliance`` or ``/synthese`` slash command in *Génération PDF* mode
+        yields a domain-oriented report. It never changes the retrieval mode.
 
         Returns ``{html, sources, metadata}``.
         """
@@ -636,6 +840,7 @@ class GeneratorService:
             self._settings.document_max_tokens, self._settings.llm_max_tokens
         )
         max_rounds = max(0, self._settings.document_max_continuations)
+        document_system = self._document_system(report_focus)
 
         if mode == "full-document" and document_id is not None:
             return await self._generate_full_document(
@@ -647,6 +852,7 @@ class GeneratorService:
                 budget=budget,
                 max_rounds=max_rounds,
                 started=started,
+                report_focus=report_focus,
             )
 
         # ---- Top-K path (unchanged behaviour, shared with Q&A retrieval) -------
@@ -661,7 +867,7 @@ class GeneratorService:
             cleaned,
             ranked,
             history=history,
-            system_prompt=DOCUMENT_SYSTEM_INSTRUCTIONS,
+            system_prompt=document_system,
         )
 
         if prompt is None:
@@ -737,6 +943,7 @@ class GeneratorService:
         budget: int,
         max_rounds: int,
         started: float,
+        report_focus: str | None = None,
     ) -> dict[str, Any]:
         """Full-document mode: analyse the WHOLE contract, not a Top-K slice.
 
@@ -780,6 +987,7 @@ class GeneratorService:
         batches = self._split_document_batches(
             chunks, self._settings.full_document_context_chars
         )
+        document_system = self._document_system(report_focus)
 
         try:
             if len(batches) == 1:
@@ -787,7 +995,7 @@ class GeneratorService:
                     question,
                     chunks,
                     history=history,
-                    system_prompt=DOCUMENT_SYSTEM_INSTRUCTIONS,
+                    system_prompt=document_system,
                     max_chars=self._settings.full_document_context_chars,
                 )
                 logger.info(
@@ -817,6 +1025,7 @@ class GeneratorService:
                         temperature=temperature,
                         budget=budget,
                         max_rounds=max_rounds,
+                        report_focus=report_focus,
                     )
                 )
                 context_chunks = len(chunks)
@@ -868,6 +1077,7 @@ class GeneratorService:
         temperature: float | None,
         budget: int,
         max_rounds: int,
+        report_focus: str | None = None,
     ) -> tuple[str, Any, bool, int, int]:
         """MAP each ordered batch into compact findings, then REDUCE into the
         final report. Used only when a contract exceeds the single-call budget.
@@ -905,7 +1115,7 @@ class GeneratorService:
                 "selon la méthode imposée.)"
             ),
             context=aggregated,
-            system_prompt=DOCUMENT_SYSTEM_INSTRUCTIONS,
+            system_prompt=self._document_system(report_focus),
         )
         joined, completion, truncated, rounds, reduce_tokens = (
             await self._complete_document(

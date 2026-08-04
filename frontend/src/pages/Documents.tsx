@@ -1,5 +1,5 @@
-import { useState, type ComponentType } from 'react'
-import { Link } from 'react-router-dom'
+import { useEffect, useState, type ComponentType } from 'react'
+import { Link, useSearchParams } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangle,
@@ -66,6 +66,8 @@ function IconAction({
 }
 
 export function DocumentsPage() {
+  const [searchParams] = useSearchParams()
+  const followedUploadId = searchParams.get('upload')
   const { data, isLoading } = useDocuments()
   const upload = useUploadDocument()
   const remove = useDeleteDocument()
@@ -76,6 +78,22 @@ export function DocumentsPage() {
   )
   const [pendingDelete, setPendingDelete] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!followedUploadId) return
+    const document = data?.find((item) => item.id === followedUploadId)
+    setActiveUploads((current) =>
+      current.some((item) => item.documentId === followedUploadId)
+        ? current
+        : [
+            {
+              documentId: followedUploadId,
+              filename: document?.filename ?? 'Document en cours',
+            },
+            ...current,
+          ].slice(0, 5),
+    )
+  }, [followedUploadId, data])
 
   const refreshLists = () => {
     void queryClient.invalidateQueries({ queryKey: ['documents'] })

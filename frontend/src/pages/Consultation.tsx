@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import {
   ChevronDown,
   Coins,
@@ -16,6 +17,7 @@ import {
   Send,
   ShieldCheck,
   Sparkles,
+  Square,
   Trash2,
   User,
   type LucideIcon,
@@ -29,15 +31,25 @@ import { Card, CardHeader } from '@/components/ui/Card'
 import { suggestions } from '@/data/mock'
 import { useDocuments, useUploadDocument } from '@/hooks/useDocuments'
 import {
+  cancelBackgroundChatJob,
   createBackgroundChatJob,
   downloadDocumentPdf,
-  generateDocument,
+  fetchBackgroundChatJobStatus,
   streamBackgroundChatJob,
   wantsDocument,
 } from '@/services/chat'
 import { fetchDocumentBlob } from '@/services/documents'
 import { fetchGeneratedDocumentBlob } from '@/services/generatedDocuments'
-import { useConversations } from '@/hooks/useConversations'
+import {
+  createConversation,
+  getConversation,
+} from '@/services/conversations'
+import {
+  CONVERSATIONS_KEY,
+  useConversationList,
+  useDeleteConversation,
+} from '@/hooks/useServerConversations'
+import { useAuth } from '@/context/AuthContext'
 import { cn } from '@/lib/cn'
 import type {
   AgentDomain,
@@ -142,20 +154,34 @@ type AgentCommand =
  *   the backend runs all three + synthesis).
  * Returns `null` for a normal message (handled by the streaming chat).
  */
+/** Alias → canonical single-agent domain (mirrors the backend router). */
+const SINGLE_AGENT_ALIASES: Record<string, AgentDomain> = {
+  legal: 'legal',
+  juridique: 'legal',
+  finance: 'finance',
+  financier: 'finance',
+  compliance: 'compliance',
+  conformite: 'compliance',
+  conformité: 'compliance',
+}
+const SYNTHESIS_ALIASES = ['synthese', 'synthèse', 'synth', 'tous', 'all']
+
 function parseAgentCommand(text: string): AgentCommand | null {
   const match = /^\/([\p{L}]+)\b([\s\S]*)$/u.exec(text.trim())
   if (!match) return null
   const cmd = match[1].toLowerCase()
   const rest = match[2].trim()
-  if (cmd === 'legal' || cmd === 'finance' || cmd === 'compliance') {
+  const domain = SINGLE_AGENT_ALIASES[cmd]
+  if (domain) {
     return {
       mode: 'single',
-      domain: cmd,
-      label: DOMAIN_STYLE[cmd].label,
-      toSend: rest ? `/${cmd} ${rest}` : `/${cmd}`,
+      domain,
+      label: DOMAIN_STYLE[domain].label,
+      // Always emit the canonical /domain token so the backend routes it.
+      toSend: rest ? `/${domain} ${rest}` : `/${domain}`,
     }
   }
-  if (['synthese', 'synthèse', 'synth', 'tous', 'all'].includes(cmd)) {
+  if (SYNTHESIS_ALIASES.includes(cmd)) {
     return {
       mode: 'multi',
       label: 'Synthèse des 3 agents',
@@ -163,6 +189,11 @@ function parseAgentCommand(text: string): AgentCommand | null {
     }
   }
   return null
+}
+
+/** Remove a leading "/command" token so a report title shows the real request. */
+function stripLeadingSlashCommand(text: string): string {
+  return text.replace(/^\s*\/[\p{L}]+\b[ \t]*/u, '').trim()
 }
 
 /** Open the generated HTML in a new tab and trigger the browser print → PDF. */
@@ -196,13 +227,40 @@ function DocumentCard({
   question,
   generatedDocumentId,
 }: {
-  html: string
+  /** Absent when reloading a persisted conversation (only the PDF is kept). */
+  html?: string
   sourceDocumentId?: string
   question?: string
   generatedDocumentId?: string
 }) {
   const [pdfLoading, setPdfLoading] = useState(false)
   const [pdfError, setPdfError] = useState<string | null>(null)
+  // For a persisted report (no inline HTML) we preview the stored PDF itself.
+  const [pdfPreviewUrl, setPdfPreviewUrl] = useState<string | null>(null)
+  const [previewLoading, setPreviewLoading] = useState(false)
+
+  useEffect(() => {
+    if (html || !generatedDocumentId) return
+    let revoked = false
+    let objectUrl: string | null = null
+    setPreviewLoading(true)
+    fetchGeneratedDocumentBlob(generatedDocumentId)
+      .then((blob) => {
+        if (revoked) return
+        objectUrl = URL.createObjectURL(blob)
+        setPdfPreviewUrl(objectUrl)
+      })
+      .catch(() => {
+        /* Preview is best-effort; the download button still works. */
+      })
+      .finally(() => {
+        if (!revoked) setPreviewLoading(false)
+      })
+    return () => {
+      revoked = true
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [html, generatedDocumentId])
 
   const handleDownloadPdf = async () => {
     setPdfError(null)
@@ -214,7 +272,7 @@ function DocumentCard({
       const filename = `document-legallink-${Date.now()}.pdf`
       const blob = generatedDocumentId
         ? await fetchGeneratedDocumentBlob(generatedDocumentId)
-        : await downloadDocumentPdf(html, {
+        : await downloadDocumentPdf(html ?? '', {
             filename,
             title,
             sourceDocumentId,
@@ -257,20 +315,24 @@ function DocumentCard({
             )}
             {pdfLoading ? 'Génération…' : 'Télécharger PDF'}
           </button>
-          <button
-            type="button"
-            onClick={() => printDocument(html)}
-            className="inline-flex items-center gap-1 rounded-lg border border-border bg-white px-2.5 py-1 text-[11px] font-medium text-slate-600 transition hover:border-brand/40 hover:text-brand"
-          >
-            <Printer className="size-3" /> Imprimer
-          </button>
-          <button
-            type="button"
-            onClick={() => downloadDocument(html)}
-            className="inline-flex items-center gap-1 rounded-lg border border-border bg-white px-2.5 py-1 text-[11px] font-medium text-slate-600 transition hover:border-brand/40 hover:text-brand"
-          >
-            <FileText className="size-3" /> HTML
-          </button>
+          {html ? (
+            <>
+              <button
+                type="button"
+                onClick={() => printDocument(html)}
+                className="inline-flex items-center gap-1 rounded-lg border border-border bg-white px-2.5 py-1 text-[11px] font-medium text-slate-600 transition hover:border-brand/40 hover:text-brand"
+              >
+                <Printer className="size-3" /> Imprimer
+              </button>
+              <button
+                type="button"
+                onClick={() => downloadDocument(html)}
+                className="inline-flex items-center gap-1 rounded-lg border border-border bg-white px-2.5 py-1 text-[11px] font-medium text-slate-600 transition hover:border-brand/40 hover:text-brand"
+              >
+                <FileText className="size-3" /> HTML
+              </button>
+            </>
+          ) : null}
         </div>
       </div>
       {pdfError ? (
@@ -278,13 +340,31 @@ function DocumentCard({
           {pdfError}
         </p>
       ) : null}
-      <iframe
-        // Sandbox with no allowances: renders styled HTML but blocks scripts.
-        sandbox=""
-        srcDoc={html}
-        title="Aperçu du document généré"
-        className="h-80 w-full bg-white"
-      />
+      {html ? (
+        <iframe
+          // Sandbox with no allowances: renders styled HTML but blocks scripts.
+          sandbox=""
+          srcDoc={html}
+          title="Aperçu du document généré"
+          className="h-80 w-full bg-white"
+        />
+      ) : pdfPreviewUrl ? (
+        <iframe
+          src={pdfPreviewUrl}
+          title="Aperçu du rapport (PDF)"
+          className="h-80 w-full bg-white"
+        />
+      ) : previewLoading ? (
+        <p className="flex items-center gap-2 px-3 py-3 text-xs text-slate-500">
+          <Loader2 className="size-3.5 animate-spin text-brand" />
+          Chargement de l’aperçu…
+        </p>
+      ) : (
+        <p className="px-3 py-3 text-xs text-slate-500">
+          Aperçu indisponible pour ce rapport enregistré — téléchargez le PDF
+          pour le consulter.
+        </p>
+      )}
     </div>
   )
 }
@@ -295,6 +375,24 @@ const THINKING_STEPS = [
   'Vérification des références…',
   'Rédaction de la réponse…',
 ]
+const ACTIVE_CONVERSATION_PREFIX = 'legallink.active-conversation.v1'
+const PENDING_JOB_PREFIX = 'legallink.pending-chat-job.v1'
+
+function pendingJobKey(userId: string, conversationId: string): string {
+  return `${PENDING_JOB_PREFIX}.${userId}.${conversationId}`
+}
+
+function setPendingJob(userId: string, conversationId: string, jobId: string): void {
+  localStorage.setItem(pendingJobKey(userId, conversationId), jobId)
+}
+
+function clearPendingJob(userId: string, conversationId: string): void {
+  localStorage.removeItem(pendingJobKey(userId, conversationId))
+}
+
+function getPendingJob(userId: string, conversationId: string): string | null {
+  return localStorage.getItem(pendingJobKey(userId, conversationId))
+}
 
 function nowLabel(): string {
   return new Date().toLocaleTimeString('fr-FR', {
@@ -330,13 +428,6 @@ function welcomeMessage(): ChatMessage {
       'Bonjour. Déposez un contrat ou posez une question juridique — je peux résumer, détecter les risques et citer les références applicables.',
     timestamp: nowLabel(),
   }
-}
-
-/** Conversation title = the first question asked (truncated). */
-function deriveTitle(messages: ChatMessage[]): string {
-  const firstUser = messages.find((m) => m.role === 'user')
-  const text = firstUser?.content.trim() || 'Nouvelle conversation'
-  return text.length > 48 ? `${text.slice(0, 48)}…` : text
 }
 
 /** Short, human relative time for the history list (e.g. "il y a 3 min"). */
@@ -529,7 +620,7 @@ function MessageRow({
               ) : null}
             </div>
           )}
-          {message.document ? (
+          {message.document || message.generatedDocumentId ? (
             <DocumentCard
               html={message.document}
               sourceDocumentId={message.generatedReportSourceDocumentId}
@@ -545,7 +636,11 @@ function MessageRow({
         <span className="mt-1 px-1 text-[10px] text-slate-400">
           {message.timestamp}
           {streaming && liveSeconds != null ? (
-            <span className="text-brand"> · {formatElapsed(liveSeconds)}</span>
+            <span className="text-brand">
+              {' · '}
+              {message.resumed ? 'Reprise en cours · ' : ''}
+              {formatElapsed(liveSeconds)}
+            </span>
           ) : message.role === 'assistant' && message.elapsed != null ? (
             <span> · Généré en {formatElapsed(message.elapsed)}</span>
           ) : null}
@@ -604,6 +699,7 @@ export function ConsultationPage() {
     'conversation',
   )
   const [sending, setSending] = useState(false)
+  const [cancelling, setCancelling] = useState(false)
   const [streamingId, setStreamingId] = useState<string | null>(null)
   const [thinkingStep, setThinkingStep] = useState(0)
   const [elapsedMs, setElapsedMs] = useState(0)
@@ -615,14 +711,27 @@ export function ConsultationPage() {
   // Slash-command menu (agent picker) state.
   const [slashIndex, setSlashIndex] = useState(0)
   const [slashClosed, setSlashClosed] = useState(false)
+  const [switchingConversation, setSwitchingConversation] = useState(false)
   const upload = useUploadDocument()
   const { data: documents } = useDocuments()
-  const { conversations, upsert, remove } = useConversations()
+  const { user } = useAuth()
+  const { data: serverConversations } = useConversationList()
+  const conversations = serverConversations ?? []
+  const deleteConversationMutation = useDeleteConversation()
+  const queryClient = useQueryClient()
   const scrollRef = useRef<HTMLDivElement>(null)
   const startRef = useRef<number>(0)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const resumingJobsRef = useRef(new Set<string>())
+  const restoredForUserRef = useRef<string | null>(null)
+  // Aborts only the LOCAL SSE reader of the current stream (never the durable
+  // Celery/Redis job) so the user can switch conversations mid-generation.
+  const streamAbortRef = useRef<AbortController | null>(null)
+  // Mirrors `activeId` so async callbacks (e.g. a resume that ends minutes
+  // later) can tell whether the user is still on the same conversation before
+  // reconciling its messages.
+  const activeIdRef = useRef<string | null>(null)
   // Whether we already auto-scoped the chat to the current attachment.
   const autoScopedRef = useRef(false)
 
@@ -635,6 +744,33 @@ export function ConsultationPage() {
   const uploadReady =
     !!activeUpload &&
     searchableDocs.some((d) => d.id === activeUpload.documentId)
+
+  const markMessageCancelled = (assistantId: string, notice: string) => {
+    setMessages((prev) =>
+      prev.map((message) => {
+        if (message.id !== assistantId) return message
+        const partial = message.content.trim()
+        return {
+          ...message,
+          content:
+            partial && !/en cours…?$/i.test(partial)
+              ? `${partial}\n\n_${notice}_`
+              : notice,
+          backgroundJobStatus: 'cancelled',
+        }
+      }),
+    )
+  }
+
+  const recordBackgroundEvent = (assistantId: string, eventCount: number) => {
+    setMessages((prev) =>
+      prev.map((message) =>
+        message.id === assistantId
+          ? { ...message, backgroundJobEventCount: eventCount }
+          : message,
+      ),
+    )
+  }
 
   const MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
@@ -674,6 +810,10 @@ export function ConsultationPage() {
     fileInputRef.current?.click()
   }
 
+  useEffect(() => {
+    activeIdRef.current = activeId
+  }, [activeId])
+
   // Once the freshly attached file is indexed, scope the chat to it so the
   // next questions target that document by default.
   useEffect(() => {
@@ -684,42 +824,335 @@ export function ConsultationPage() {
     }
   }, [searchableDocs, activeUpload])
 
-  // Persist the active conversation whenever it changes (once it has a real
-  // question). New conversations get an id lazily in `send`.
+  // Restore the last-open conversation for this browser once per login. The
+  // conversation's messages (and any still-running job) come from PostgreSQL.
   useEffect(() => {
-    if (!activeId) return
-    if (!messages.some((m) => m.role === 'user')) return
-    const existing = conversations.find((c) => c.id === activeId)
-    upsert({
-      id: activeId,
-      title: deriveTitle(messages),
-      messages,
-      createdAt: existing?.createdAt ?? Date.now(),
-      updatedAt: Date.now(),
-    })
-    // `conversations`/`upsert` are intentionally excluded to avoid a save loop.
+    if (!user || restoredForUserRef.current === user.id) return
+    restoredForUserRef.current = user.id
+    const savedId = localStorage.getItem(`${ACTIVE_CONVERSATION_PREFIX}.${user.id}`)
+    if (!savedId) return
+    void loadConversation(savedId)
+    // `loadConversation` is a stable closure for the lifetime of this mount.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [messages, activeId])
+  }, [user])
+
+  /**
+   * Detach the LOCAL live stream so the user can switch conversations while a
+   * reply is still generating. The Celery/Redis job keeps running and its reply
+   * is persisted; the pending-job marker is intentionally kept so returning to
+   * that conversation resumes/reconciles it.
+   */
+  const detachActiveStream = () => {
+    streamAbortRef.current?.abort()
+    streamAbortRef.current = null
+    setStreamingId(null)
+    setSending(false)
+    setCancelling(false)
+  }
 
   const startNewConversation = () => {
-    if (sending) return
+    if (switchingConversation) return
+    detachActiveStream()
+    if (user) {
+      localStorage.removeItem(`${ACTIVE_CONVERSATION_PREFIX}.${user.id}`)
+    }
+    activeIdRef.current = null
     setActiveId(null)
     setMessages([welcomeMessage()])
     setDraft('')
   }
 
-  const openConversation = (id: string) => {
-    if (sending || id === activeId) return
-    const conversation = conversations.find((c) => c.id === id)
-    if (!conversation) return
-    setActiveId(id)
-    setMessages(
-      conversation.messages.length ? conversation.messages : [welcomeMessage()],
+  /**
+   * Resume an unfinished Redis-backed background job for `conversationId`
+   * (e.g. the user navigated away or refreshed mid-generation). The reply
+   * itself is durably persisted by the Celery task once it completes, so
+   * this only needs to catch up the live UI.
+   */
+  const maybeResumePendingJob = async (conversationId: string) => {
+    if (!user) return
+    const jobId = getPendingJob(user.id, conversationId)
+    if (!jobId || resumingJobsRef.current.has(jobId)) return
+
+    let status
+    try {
+      status = await fetchBackgroundChatJobStatus(jobId)
+    } catch {
+      clearPendingJob(user.id, conversationId)
+      return
+    }
+    if (status.status !== 'queued' && status.status !== 'processing') {
+      // The job finished while we were away. Its reply is durably persisted, so
+      // reload the conversation from PostgreSQL to show the completed answer
+      // (loadConversation may have run before the reply landed in the DB).
+      clearPendingJob(user.id, conversationId)
+      try {
+        const { messages: loaded } = await getConversation(conversationId)
+        if (loaded.length) setMessages(loaded)
+      } catch {
+        /* Keep whatever is on screen if the reload fails. */
+      }
+      return
+    }
+
+    resumingJobsRef.current.add(jobId)
+    // Resume the elapsed timer from the job's real queue time, not from zero.
+    const startedAt = status.createdAt ? Date.parse(status.createdAt) : NaN
+    startRef.current = Number.isNaN(startedAt) ? Date.now() : startedAt
+    const assistantId = crypto.randomUUID()
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: assistantId,
+        role: 'assistant',
+        // Reports emit no fragments until the PDF is ready, so show an explicit
+        // "still running in the background" note instead of an empty bubble.
+        content:
+          status.mode === 'report'
+            ? 'Le rapport est toujours en cours de génération en arrière-plan…'
+            : '',
+        timestamp: nowLabel(),
+        resumed: true,
+        backgroundJobId: jobId,
+        backgroundJobMode: status.mode,
+        backgroundJobStatus: 'processing',
+        backgroundJobEventCount: 0,
+      },
+    ])
+    setSending(true)
+    setStreamingId(assistantId)
+
+    const controller = new AbortController()
+    streamAbortRef.current = controller
+    let restoredSources: ChatMessageSource[] = []
+    await streamBackgroundChatJob(
+      jobId,
+      {
+        onEvent: (eventCount) => {
+          recordBackgroundEvent(assistantId, eventCount)
+        },
+        onAgent: ({ domain, label }) => {
+          setMessages((prev) =>
+            prev.map((message) =>
+              message.id === assistantId
+                ? {
+                    ...message,
+                    agentLabel:
+                      DOMAIN_STYLE[domain as AgentDomain]?.label ??
+                      label ??
+                      message.agentLabel,
+                  }
+                : message,
+            ),
+          )
+        },
+        onSources: (incoming) => {
+          restoredSources = toMessageSources(incoming)
+          setMessages((prev) =>
+            prev.map((message) =>
+              message.id === assistantId
+                ? { ...message, sources: restoredSources }
+                : message,
+            ),
+          )
+        },
+        onAnalyses: (list) => {
+          const analyses: ChatAgentAnalysis[] = list.map((analysis) => ({
+            domain: analysis.domain ?? '',
+            label:
+              DOMAIN_STYLE[analysis.domain as AgentDomain]?.label ??
+              analysis.label,
+            status: analysis.status,
+            answer:
+              analysis.answer || analysis.message || 'Analyse indisponible.',
+            sources: toMessageSources(analysis.sources ?? []),
+          }))
+          setMessages((prev) =>
+            prev.map((message) =>
+              message.id === assistantId
+                ? { ...message, agentAnalyses: analyses }
+                : message,
+            ),
+          )
+        },
+        onDocument: ({
+          html,
+          generatedDocumentId,
+          sources: incoming,
+          metadata,
+        }) => {
+          restoredSources = toMessageSources(incoming)
+          const sourceIds = Array.from(
+            new Set(
+              incoming.map((source) => source.document_id).filter(Boolean),
+            ),
+          )
+          setMessages((prev) =>
+            prev.map((message) =>
+              message.id === assistantId
+                ? {
+                    ...message,
+                    content:
+                      'Le rapport est prêt. Vous pouvez le consulter ou le télécharger.',
+                    document: html,
+                    generatedDocumentId,
+                    generatedReportSourceDocumentId:
+                      message.generatedReportSourceDocumentId ||
+                      (sourceIds.length === 1 ? sourceIds[0] : undefined),
+                    sources: restoredSources,
+                    elapsed:
+                      typeof metadata.generation_time === 'number'
+                        ? metadata.generation_time
+                        : message.elapsed,
+                  }
+                : message,
+            ),
+          )
+        },
+        onDelta: (text) => {
+          setMessages((prev) =>
+            prev.map((message) =>
+              message.id === assistantId
+                ? { ...message, content: message.content + text }
+                : message,
+            ),
+          )
+        },
+        onDone: ({ answer, metadata }) => {
+          setMessages((prev) =>
+            prev.map((message) =>
+              message.id === assistantId
+                ? {
+                    ...message,
+                    content: message.content || answer || '',
+                    sources: restoredSources.length
+                      ? restoredSources
+                      : message.sources,
+                    elapsed:
+                      typeof metadata.generation_time === 'number'
+                        ? metadata.generation_time
+                        : message.elapsed,
+                    backgroundJobStatus: 'completed',
+                  }
+                : message,
+            ),
+          )
+        },
+        onCancelled: (notice) => {
+          markMessageCancelled(assistantId, notice)
+        },
+        onError: (message) => {
+          setMessages((prev) =>
+            prev.map((item) =>
+              item.id === assistantId
+                ? {
+                    ...item,
+                    content:
+                      item.content ||
+                      `Désolé, la génération a échoué : ${message}`,
+                    backgroundJobStatus: 'failed',
+                  }
+                : item,
+            ),
+          )
+        },
+      },
+      { after: 0, signal: controller.signal },
     )
+
+    resumingJobsRef.current.delete(jobId)
+    // The user switched conversations mid-resume: leave the durable job (and its
+    // pending marker) untouched so it can be resumed again later.
+    if (controller.signal.aborted || activeIdRef.current !== conversationId)
+      return
+    if (streamAbortRef.current === controller) streamAbortRef.current = null
+    setStreamingId(null)
+    setSending(false)
+
+    // The stream ended: either the job finished, or the connection dropped
+    // during a long, event-less report. Re-check the durable status.
+    let stillRunning = false
+    try {
+      const latest = await fetchBackgroundChatJobStatus(jobId)
+      stillRunning =
+        latest.status === 'queued' || latest.status === 'processing'
+    } catch {
+      stillRunning = false
+    }
+    if (stillRunning) {
+      // Keep the pending marker so a later refresh resumes it again, and leave
+      // the "still generating in background" note visible.
+      return
+    }
+    // Terminal: forget the job and reconcile with the durably-persisted reply
+    // so the final message (incl. any generated PDF) is authoritative even if
+    // the live stream ended partial. Skip if the user switched conversations.
+    clearPendingJob(user.id, conversationId)
+    if (activeIdRef.current === conversationId) {
+      try {
+        const { messages: loaded } = await getConversation(conversationId)
+        if (loaded.length) setMessages(loaded)
+      } catch {
+        /* Keep whatever is on screen if the reload fails. */
+      }
+    }
+  }
+
+  /** Fetch a persisted conversation's messages from PostgreSQL and open it. */
+  const loadConversation = async (id: string) => {
+    if (!user) return
+    setSwitchingConversation(true)
+    try {
+      const { messages: loaded } = await getConversation(id)
+      activeIdRef.current = id
+      setActiveId(id)
+      setMessages(loaded.length ? loaded : [welcomeMessage()])
+      localStorage.setItem(`${ACTIVE_CONVERSATION_PREFIX}.${user.id}`, id)
+      setDraft('')
+    } catch {
+      // Deleted or inaccessible remotely — fall back to a fresh chat.
+      localStorage.removeItem(`${ACTIVE_CONVERSATION_PREFIX}.${user.id}`)
+      setActiveId(null)
+      setMessages([welcomeMessage()])
+      setSwitchingConversation(false)
+      return
+    }
+    setSwitchingConversation(false)
+    void maybeResumePendingJob(id)
+  }
+
+  /** Refetch the sidebar so a freshly-titled/updated conversation appears. */
+  const refreshConversations = () =>
+    void queryClient.invalidateQueries({ queryKey: CONVERSATIONS_KEY })
+
+  /** First message of a fresh chat → create the persisted conversation lazily. */
+  const ensureConversationId = async (): Promise<string | null> => {
+    if (activeId) return activeId
+    try {
+      const created = await createConversation()
+      activeIdRef.current = created.id
+      setActiveId(created.id)
+      if (user) {
+        localStorage.setItem(
+          `${ACTIVE_CONVERSATION_PREFIX}.${user.id}`,
+          created.id,
+        )
+      }
+      void queryClient.invalidateQueries({ queryKey: CONVERSATIONS_KEY })
+      return created.id
+    } catch {
+      return null
+    }
+  }
+
+  const openConversation = (id: string) => {
+    if (switchingConversation || id === activeId) return
+    detachActiveStream()
+    void loadConversation(id)
   }
 
   const deleteConversation = (id: string) => {
-    remove(id)
+    if (user) clearPendingJob(user.id, id)
+    void deleteConversationMutation.mutateAsync(id)
     if (id === activeId) startNewConversation()
   }
 
@@ -741,149 +1174,21 @@ export function ConsultationPage() {
     return () => clearInterval(id)
   }, [sending])
 
-  // Live elapsed timer while the assistant is thinking / streaming.
+  // Live elapsed timer while the assistant is thinking / streaming. It counts
+  // from `startRef` (an epoch ms), which a fresh send sets to `Date.now()` and
+  // a resume seeds with the job's real queue time — so refreshing the page mid
+  // generation never restarts the chrono at zero.
   useEffect(() => {
     if (!sending) return
-    const start = performance.now()
-    setElapsedMs(0)
-    const id = setInterval(() => setElapsedMs(performance.now() - start), 100)
+    const tick = () => setElapsedMs(Math.max(0, Date.now() - startRef.current))
+    tick()
+    const id = setInterval(tick, 100)
     return () => clearInterval(id)
   }, [sending])
-
-  // Reconnect to any unfinished Redis-backed response when a saved
-  // conversation is reopened after navigation or a browser refresh.
-  useEffect(() => {
-    if (sending) return
-    const pending = messages.find(
-      (message) =>
-        message.role === 'assistant' &&
-        message.backgroundJobId &&
-        message.backgroundJobStatus === 'processing',
-    )
-    if (!pending?.backgroundJobId) return
-    if (resumingJobsRef.current.has(pending.backgroundJobId)) return
-
-    const jobId = pending.backgroundJobId
-    const assistantId = pending.id
-    resumingJobsRef.current.add(jobId)
-    setSending(true)
-    setStreamingId(assistantId)
-    setMessages((prev) =>
-      prev.map((message) =>
-        message.id === assistantId
-          ? {
-              ...message,
-              content: '',
-              sources: [],
-              agentAnalyses: undefined,
-            }
-          : message,
-      ),
-    )
-
-    let restoredSources: ChatMessageSource[] = []
-    void streamBackgroundChatJob(jobId, {
-      onAgent: ({ domain, label }) => {
-        setMessages((prev) =>
-          prev.map((message) =>
-            message.id === assistantId
-              ? {
-                  ...message,
-                  agentLabel:
-                    DOMAIN_STYLE[domain as AgentDomain]?.label ??
-                    label ??
-                    message.agentLabel,
-                }
-              : message,
-          ),
-        )
-      },
-      onSources: (incoming) => {
-        restoredSources = toMessageSources(incoming)
-        setMessages((prev) =>
-          prev.map((message) =>
-            message.id === assistantId
-              ? { ...message, sources: restoredSources }
-              : message,
-          ),
-        )
-      },
-      onAnalyses: (list) => {
-        const analyses: ChatAgentAnalysis[] = list.map((analysis) => ({
-          domain: analysis.domain ?? '',
-          label:
-            DOMAIN_STYLE[analysis.domain as AgentDomain]?.label ?? analysis.label,
-          status: analysis.status,
-          answer:
-            analysis.answer || analysis.message || 'Analyse indisponible.',
-          sources: toMessageSources(analysis.sources ?? []),
-        }))
-        setMessages((prev) =>
-          prev.map((message) =>
-            message.id === assistantId
-              ? { ...message, agentAnalyses: analyses }
-              : message,
-          ),
-        )
-      },
-      onDelta: (text) => {
-        setMessages((prev) =>
-          prev.map((message) =>
-            message.id === assistantId
-              ? { ...message, content: message.content + text }
-              : message,
-          ),
-        )
-      },
-      onDone: ({ answer, metadata }) => {
-        setMessages((prev) =>
-          prev.map((message) =>
-            message.id === assistantId
-              ? {
-                  ...message,
-                  content: message.content || answer || '',
-                  sources: restoredSources.length
-                    ? restoredSources
-                    : message.sources,
-                  elapsed:
-                    typeof metadata.generation_time === 'number'
-                      ? metadata.generation_time
-                      : message.elapsed,
-                  backgroundJobStatus: 'completed',
-                }
-              : message,
-          ),
-        )
-      },
-      onError: (message) => {
-        setMessages((prev) =>
-          prev.map((item) =>
-            item.id === assistantId
-              ? {
-                  ...item,
-                  content:
-                    item.content ||
-                    `Désolé, la génération a échoué : ${message}`,
-                  backgroundJobStatus: 'failed',
-                }
-              : item,
-          ),
-        )
-      },
-    }).finally(() => {
-      resumingJobsRef.current.delete(jobId)
-      setStreamingId(null)
-      setSending(false)
-    })
-    // The Set prevents duplicate followers while replayed fragments update messages.
-  }, [messages, sending])
 
   const send = async (content: string) => {
     const trimmed = content.trim()
     if (!trimmed || sending) return
-
-    // First message of a fresh chat → open a new persisted conversation.
-    if (!activeId) setActiveId(crypto.randomUUID())
 
     setMessages((prev) => [
       ...prev,
@@ -895,15 +1200,15 @@ export function ConsultationPage() {
       },
     ])
     setDraft('')
+    startRef.current = Date.now()
     setSending(true)
-    startRef.current = performance.now()
 
     const assistantId = crypto.randomUUID()
     let started = false
     let sources: ChatMessageSource[] = []
 
     const measuredElapsed = () =>
-      Math.round(((performance.now() - startRef.current) / 1000) * 10) / 10
+      Math.round(((Date.now() - startRef.current) / 1000) * 10) / 10
 
     // Conversation mode never creates files implicitly. If the user asks for
     // one, guide them to the explicit generation mode instead.
@@ -922,11 +1227,13 @@ export function ConsultationPage() {
       return
     }
 
-    // Agent mode: the message starts with a slash command (/legal, /finance,
-    // /compliance → one agent; /synthese → all three + streamed synthesis).
-    // Streamed (fragmented) exactly like the normal chat, via /agents/stream.
+    // Agent mode (Conversation only): the message starts with a slash command
+    // (/legal, /finance, /compliance → one agent; /synthese → all three +
+    // streamed synthesis). Streamed (fragmented) exactly like the normal chat.
+    // In Génération PDF mode the SAME commands fall through to the report path
+    // below, which produces a domain-specialised PDF instead of a text answer.
     const agentCmd = parseAgentCommand(trimmed)
-    if (agentCmd) {
+    if (agentCmd && chatMode === 'conversation') {
       let agentLabel: string | undefined =
         agentCmd.mode === 'single' ? agentCmd.label : undefined
       let agentAnalyses: ChatAgentAnalysis[] | undefined
@@ -956,6 +1263,16 @@ export function ConsultationPage() {
         })
       }
 
+      const conversationId = await ensureConversationId()
+      if (!conversationId) {
+        upsertAssistant({
+          content:
+            'Désolé, impossible de démarrer une conversation. Veuillez réessayer.',
+        })
+        setSending(false)
+        return
+      }
+
       let job
       try {
         job = await createBackgroundChatJob(agentCmd.toSend, {
@@ -963,6 +1280,7 @@ export function ConsultationPage() {
           topK: 15,
           finalK: 5,
           documentId: selectedDocId || null,
+          conversationId,
         })
       } catch (error) {
         upsertAssistant({
@@ -975,15 +1293,26 @@ export function ConsultationPage() {
       }
       started = true
       setStreamingId(assistantId)
+      if (user) setPendingJob(user.id, conversationId, job.jobId)
+      refreshConversations()
+      // The user switched conversations during setup: the durable job keeps
+      // running (resumable later), so don't stream into a foreign conversation.
+      if (activeIdRef.current !== conversationId) return
       upsertAssistant({
         backgroundJobId: job.jobId,
         backgroundJobMode: 'agent',
         backgroundJobStatus: 'processing',
+        backgroundJobEventCount: 0,
       })
 
+      const controller = new AbortController()
+      streamAbortRef.current = controller
       await streamBackgroundChatJob(
         job.jobId,
         {
+          onEvent: (eventCount) => {
+            recordBackgroundEvent(assistantId, eventCount)
+          },
           onAgent: ({ mode, domain, label }) => {
             if (mode === 'single') {
               agentLabel =
@@ -1040,6 +1369,9 @@ export function ConsultationPage() {
               backgroundJobStatus: 'completed',
             })
           },
+          onCancelled: (notice) => {
+            markMessageCancelled(assistantId, notice)
+          },
           onError: (msg) => {
             if (!started) {
               setMessages((prev) => [
@@ -1066,62 +1398,197 @@ export function ConsultationPage() {
             }
           },
         },
+        { signal: controller.signal },
       )
 
+      // Aborted by a conversation switch: keep the durable job + pending marker.
+      if (controller.signal.aborted || activeIdRef.current !== conversationId)
+        return
+      if (streamAbortRef.current === controller) streamAbortRef.current = null
+      if (user) clearPendingJob(user.id, conversationId)
       setStreamingId(null)
       setSending(false)
       return
     }
 
-    // Generation mode: every request becomes a persisted, branded PDF.
+    // Generation mode: every request becomes a persisted, branded PDF. A
+    // leading slash command (/legal, /finance, /compliance, /synthese) makes
+    // the backend produce a domain-specialised report; the token is stripped
+    // from the on-screen title but kept in the request the backend parses.
     if (chatMode === 'generation') {
-      try {
-        const result = await generateDocument(trimmed, {
-          topK: 15,
-          finalK: 5,
-          documentId: selectedDocId || null,
-        })
-        const docSources = toMessageSources(result.sources)
-        const sourceIds = Array.from(
-          new Set(result.sources.map((source) => source.document_id).filter(Boolean)),
-        )
-        const reportSourceDocumentId =
-          selectedDocId || (sourceIds.length === 1 ? sourceIds[0] : undefined)
-        const elapsed =
-          typeof result.metadata?.generation_time === 'number'
-            ? (result.metadata.generation_time as number)
-            : measuredElapsed()
+      const reportQuestion = stripLeadingSlashCommand(trimmed) || trimmed
+      const conversationId = await ensureConversationId()
+      if (!conversationId) {
         setMessages((prev) => [
           ...prev,
           {
             id: assistantId,
             role: 'assistant',
             content:
-              'Voici le document généré à partir de vos documents. Vous pouvez l’imprimer en PDF ou le télécharger.',
-            document: result.html,
-            generatedReportSourceDocumentId: reportSourceDocumentId,
-            generatedReportQuestion: trimmed,
-            generatedDocumentId: result.generated_document_id,
-            sources: docSources,
+              'Désolé, impossible de démarrer une conversation. Veuillez réessayer.',
             timestamp: nowLabel(),
-            elapsed,
           },
         ])
-      } catch (err) {
-        const msg =
-          err instanceof Error ? err.message : 'La génération a échoué.'
+        setSending(false)
+        return
+      }
+      let controller: AbortController | null = null
+      try {
+        const reportJob = await createBackgroundChatJob(trimmed, {
+          mode: 'report',
+          topK: 15,
+          finalK: 5,
+          documentId: selectedDocId || null,
+          conversationId,
+        })
+        if (user) setPendingJob(user.id, conversationId, reportJob.jobId)
+        refreshConversations()
+        // Switched conversations during setup: leave the durable job to resume.
+        if (activeIdRef.current !== conversationId) return
         setMessages((prev) => [
           ...prev,
           {
             id: assistantId,
             role: 'assistant',
-            content: `Désolé, la génération du document a échoué : ${msg}`,
+            content: 'Création du rapport en cours…',
+            generatedReportSourceDocumentId: selectedDocId || undefined,
+            generatedReportQuestion: reportQuestion,
             timestamp: nowLabel(),
+            backgroundJobId: reportJob.jobId,
+            backgroundJobMode: 'report',
+            backgroundJobStatus: 'processing',
+            backgroundJobEventCount: 0,
           },
         ])
+        setStreamingId(assistantId)
+        controller = new AbortController()
+        streamAbortRef.current = controller
+        await streamBackgroundChatJob(reportJob.jobId, {
+          onEvent: (eventCount) => {
+            recordBackgroundEvent(assistantId, eventCount)
+          },
+          onDocument: ({
+            html,
+            generatedDocumentId,
+            sources: incoming,
+            metadata,
+          }) => {
+            const sourceIds = Array.from(
+              new Set(incoming.map((source) => source.document_id).filter(Boolean)),
+            )
+            const sourceDocumentId =
+              selectedDocId ||
+              (sourceIds.length === 1 ? sourceIds[0] : undefined)
+            setMessages((prev) =>
+              prev.map((message) =>
+                message.id === assistantId
+                  ? {
+                      ...message,
+                      content:
+                        'Le rapport est prêt. Vous pouvez le consulter ou le télécharger.',
+                      document: html,
+                      generatedDocumentId,
+                      generatedReportSourceDocumentId: sourceDocumentId,
+                      sources: toMessageSources(incoming),
+                      elapsed:
+                        typeof metadata.generation_time === 'number'
+                          ? metadata.generation_time
+                          : measuredElapsed(),
+                    }
+                  : message,
+              ),
+            )
+          },
+          onDone: ({ answer }) => {
+            // Normally the PDF arrived via onDocument; if not (e.g. an
+            // out-of-domain slash command was refused), show the message.
+            setMessages((prev) =>
+              prev.map((message) =>
+                message.id === assistantId
+                  ? {
+                      ...message,
+                      content: message.document
+                        ? message.content
+                        : answer || message.content,
+                      backgroundJobStatus: 'completed',
+                    }
+                  : message,
+              ),
+            )
+          },
+          onCancelled: (notice) => {
+            markMessageCancelled(assistantId, notice)
+          },
+          onError: (message) => {
+            setMessages((prev) =>
+              prev.map((item) =>
+                item.id === assistantId
+                  ? {
+                      ...item,
+                      content: `La génération du rapport a échoué : ${message}`,
+                      backgroundJobStatus: 'failed',
+                    }
+                  : item,
+              ),
+            )
+          },
+        }, { signal: controller.signal })
+      } catch (err) {
+        const msg =
+          err instanceof Error ? err.message : 'La génération a échoué.'
+        setMessages((prev) => {
+          const exists = prev.some((message) => message.id === assistantId)
+          if (exists) {
+            return prev.map((message) =>
+              message.id === assistantId
+                ? {
+                    ...message,
+                    content: `La génération du rapport a échoué : ${msg}`,
+                    backgroundJobStatus: 'failed',
+                  }
+                : message,
+            )
+          }
+          return [
+            ...prev,
+            {
+              id: assistantId,
+              role: 'assistant',
+              content: `La génération du rapport a échoué : ${msg}`,
+              timestamp: nowLabel(),
+            },
+          ]
+        })
       } finally {
-        setSending(false)
+        // If the user switched conversations mid-generation the stream was
+        // aborted locally; keep the durable job + pending marker so it can be
+        // resumed later instead of clearing it here.
+        const aborted =
+          controller?.signal.aborted || activeIdRef.current !== conversationId
+        if (!aborted) {
+          if (streamAbortRef.current === controller)
+            streamAbortRef.current = null
+          if (user) clearPendingJob(user.id, conversationId)
+          setStreamingId(null)
+          setSending(false)
+        }
       }
+      return
+    }
+
+    const conversationId = await ensureConversationId()
+    if (!conversationId) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: assistantId,
+          role: 'assistant',
+          content:
+            'Désolé, impossible de démarrer une conversation. Veuillez réessayer.',
+          timestamp: nowLabel(),
+        },
+      ])
+      setSending(false)
       return
     }
 
@@ -1132,6 +1599,7 @@ export function ConsultationPage() {
         topK: 15,
         finalK: 5,
         documentId: selectedDocId || null,
+        conversationId,
       })
     } catch (error) {
       setMessages((prev) => [
@@ -1150,6 +1618,10 @@ export function ConsultationPage() {
     }
     started = true
     setStreamingId(assistantId)
+    if (user) setPendingJob(user.id, conversationId, job.jobId)
+    refreshConversations()
+    // Switched conversations during setup: keep the durable job for later resume.
+    if (activeIdRef.current !== conversationId) return
     setMessages((prev) => [
       ...prev,
       {
@@ -1161,12 +1633,18 @@ export function ConsultationPage() {
         backgroundJobId: job.jobId,
         backgroundJobMode: 'chat',
         backgroundJobStatus: 'processing',
+        backgroundJobEventCount: 0,
       },
     ])
 
+    const controller = new AbortController()
+    streamAbortRef.current = controller
     await streamBackgroundChatJob(
       job.jobId,
       {
+        onEvent: (eventCount) => {
+          recordBackgroundEvent(assistantId, eventCount)
+        },
         onSources: (incoming) => {
           sources = toMessageSources(incoming)
         },
@@ -1227,6 +1705,9 @@ export function ConsultationPage() {
             ),
           )
         },
+        onCancelled: (notice) => {
+          markMessageCancelled(assistantId, notice)
+        },
         onError: (msg) => {
           if (!started) {
             setMessages((prev) => [
@@ -1253,10 +1734,47 @@ export function ConsultationPage() {
           }
         },
       },
+      { signal: controller.signal },
     )
 
+    // Aborted by a conversation switch: keep the durable job + pending marker.
+    if (controller.signal.aborted || activeIdRef.current !== conversationId)
+      return
+    if (streamAbortRef.current === controller) streamAbortRef.current = null
+    if (user) clearPendingJob(user.id, conversationId)
     setStreamingId(null)
     setSending(false)
+  }
+
+  const activeJobMessage = messages.find(
+    (message) =>
+      message.id === streamingId &&
+      message.backgroundJobId &&
+      message.backgroundJobStatus === 'processing',
+  )
+
+  const stopGeneration = async () => {
+    if (!activeJobMessage?.backgroundJobId || cancelling) return
+    setCancelling(true)
+    setAttachError(null)
+    try {
+      await cancelBackgroundChatJob(activeJobMessage.backgroundJobId)
+      resumingJobsRef.current.delete(activeJobMessage.backgroundJobId)
+      markMessageCancelled(
+        activeJobMessage.id,
+        'Génération arrêtée à votre demande.',
+      )
+      setStreamingId(null)
+      setSending(false)
+    } catch (error) {
+      setAttachError(
+        error instanceof Error
+          ? error.message
+          : "La génération n'a pas pu être arrêtée. Veuillez réessayer.",
+      )
+    } finally {
+      setCancelling(false)
+    }
   }
 
   // Slash-command (agent picker) menu: shown while the composer holds only a
@@ -1271,11 +1789,9 @@ export function ConsultationPage() {
     slashToken === null
       ? []
       : SLASH_COMMANDS.filter((c) => c.key.startsWith(slashToken))
-  const slashMenuOpen =
-    chatMode === 'conversation' &&
-    !slashClosed &&
-    !sending &&
-    slashMatches.length > 0
+  // The agent picker is available in both modes: in Conversation it streams a
+  // text answer, in Génération PDF it produces a domain-specialised report.
+  const slashMenuOpen = !slashClosed && !sending && slashMatches.length > 0
   const activeSlash = Math.min(slashIndex, Math.max(0, slashMatches.length - 1))
 
   const applySlash = (cmd: SlashCommand) => {
@@ -1306,8 +1822,8 @@ export function ConsultationPage() {
           <button
             type="button"
             onClick={startNewConversation}
-            disabled={sending}
-            title="Démarrer une nouvelle conversation"
+            disabled={switchingConversation}
+            title="Démarrer une nouvelle conversation (la génération en cours continue en arrière-plan)"
             className="inline-flex items-center gap-1.5 rounded-lg bg-white/15 px-3 py-1.5 text-xs font-medium text-white backdrop-blur transition hover:bg-white/25 disabled:opacity-50"
           >
             <Plus className="size-3.5" />
@@ -1367,7 +1883,7 @@ export function ConsultationPage() {
               disabled={sending}
               onClick={() => {
                 setChatMode('generation')
-                setSlashClosed(true)
+                setSlashClosed(false)
               }}
               className={cn(
                 'flex flex-1 items-center justify-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition disabled:opacity-50',
@@ -1431,7 +1947,9 @@ export function ConsultationPage() {
             {slashMenuOpen ? (
               <div className="absolute bottom-full left-0 z-20 mb-2 w-full max-w-md overflow-hidden rounded-xl border border-border bg-white shadow-lg">
                 <p className="border-b border-border px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-slate-400">
-                  Interroger un agent
+                  {chatMode === 'generation'
+                    ? 'Générer un rapport PDF spécialisé'
+                    : 'Interroger un agent'}
                 </p>
                 {slashMatches.map((cmd, i) => {
                   const Icon = cmd.icon
@@ -1539,34 +2057,55 @@ export function ConsultationPage() {
                 rows={1}
                 placeholder={
                   chatMode === 'generation'
-                    ? 'Décrivez le rapport PDF à générer…'
+                    ? 'Décrivez le rapport PDF… (ou / pour un rapport d’agent)'
                     : 'Écrivez votre message… (tapez / pour choisir un agent)'
                 }
-                disabled={sending}
+                disabled={sending || switchingConversation}
                 className="max-h-32 min-h-[44px] flex-1 resize-none bg-transparent py-2.5 text-sm outline-none placeholder:text-slate-400 disabled:opacity-60"
               />
-              <Button
-                size="sm"
-                className="rounded-xl"
-                onClick={() => send(draft)}
-                disabled={sending || !draft.trim()}
-                leftIcon={
-                  sending ? (
-                    <Loader2 className="size-4 animate-spin" />
-                  ) : (
-                    <Send className="size-4" />
-                  )
-                }
-              >
-                {sending ? 'Analyse…' : 'Envoyer'}
-              </Button>
+              {sending && activeJobMessage ? (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  className="rounded-xl"
+                  onClick={stopGeneration}
+                  disabled={cancelling}
+                  leftIcon={
+                    cancelling ? (
+                      <Loader2 className="size-4 animate-spin" />
+                    ) : (
+                      <Square className="size-3.5 fill-current" />
+                    )
+                  }
+                >
+                  {cancelling ? 'Arrêt…' : 'Arrêter'}
+                </Button>
+              ) : (
+                <Button
+                  size="sm"
+                  className="rounded-xl"
+                  onClick={() => send(draft)}
+                  disabled={sending || switchingConversation || !draft.trim()}
+                  leftIcon={
+                    sending ? (
+                      <Loader2 className="size-4 animate-spin" />
+                    ) : (
+                      <Send className="size-4" />
+                    )
+                  }
+                >
+                  {sending ? 'Analyse…' : 'Envoyer'}
+                </Button>
+              )}
             </div>
           </div>
           <p className="mt-2 px-1 text-[11px] text-slate-400">
             {chatMode === 'generation' ? (
               <>
-                Chaque demande crée et enregistre automatiquement un PDF ·
-                Entrée pour envoyer
+                Chaque demande crée et enregistre automatiquement un PDF · Tapez{' '}
+                <code className="rounded bg-slate-100 px-1">/</code> pour un
+                rapport spécialisé (juridique, financier, conformité) · Entrée
+                pour envoyer
               </>
             ) : (
               <>
@@ -1592,8 +2131,8 @@ export function ConsultationPage() {
               <button
                 type="button"
                 onClick={startNewConversation}
-                disabled={sending}
-                title="Nouvelle conversation"
+                disabled={switchingConversation}
+                title="Nouvelle conversation (la génération en cours continue en arrière-plan)"
                 className="inline-flex items-center gap-1 rounded-lg border border-border px-2 py-1 text-xs font-medium text-slate-600 transition hover:border-brand/40 hover:text-brand disabled:opacity-50"
               >
                 <Plus className="size-3.5" />
@@ -1616,7 +2155,7 @@ export function ConsultationPage() {
                   <button
                     type="button"
                     onClick={() => openConversation(conv.id)}
-                    disabled={sending}
+                    disabled={switchingConversation}
                     className="flex min-w-0 flex-1 items-start gap-2 text-left disabled:cursor-not-allowed"
                   >
                     <MessageSquare
@@ -1634,10 +2173,10 @@ export function ConsultationPage() {
                             : 'text-slate-700',
                         )}
                       >
-                        {conv.title}
+                        {conv.title || 'Nouvelle conversation'}
                       </span>
                       <span className="block text-[10px] text-slate-400">
-                        {relativeTime(conv.updatedAt)}
+                        {relativeTime(new Date(conv.updatedAt).getTime())}
                       </span>
                     </span>
                   </button>
@@ -1655,8 +2194,8 @@ export function ConsultationPage() {
             </div>
           ) : (
             <p className="mt-2 text-xs text-slate-400">
-              Vos conversations apparaîtront ici et seront conservées sur cet
-              appareil.
+              Vos conversations apparaîtront ici, enregistrées et accessibles
+              depuis n’importe quelle session.
             </p>
           )}
         </Card>
@@ -1687,7 +2226,7 @@ export function ConsultationPage() {
                 key={item.id}
                 type="button"
                 onClick={() => send(item.label)}
-                disabled={sending}
+                disabled={sending || switchingConversation}
                 className="rounded-lg border border-border bg-white px-3 py-2.5 text-left text-sm text-slate-700 transition hover:border-brand/40 hover:bg-brand-soft hover:text-brand disabled:cursor-not-allowed disabled:opacity-60"
               >
                 {item.label}

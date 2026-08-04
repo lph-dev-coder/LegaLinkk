@@ -11,10 +11,12 @@ import {
   HelpCircle,
   Loader2,
   RefreshCw,
+  Sparkles,
 } from 'lucide-react'
 import { ScoreGauge } from '@/components/charts/ScoreGauge'
 import { LoadingSpinner } from '@/components/LoadingSpinner'
 import { MarkdownText } from '@/components/MarkdownText'
+import { MultiAgentSynthesis } from '@/components/MultiAgentSynthesis'
 import { RiskBadge } from '@/components/StatusBadge'
 import { Button } from '@/components/ui/Button'
 import { Card, CardHeader } from '@/components/ui/Card'
@@ -23,6 +25,7 @@ import {
   useLegalAnalysis,
   useRefreshLegalAnalysis,
 } from '@/hooks/useDocuments'
+import { useContractSynthesis } from '@/hooks/useSynthesis'
 import { useGeneratedDocuments } from '@/hooks/useGeneratedDocuments'
 import { cn } from '@/lib/cn'
 import { downloadDocumentPdf } from '@/services/chat'
@@ -186,7 +189,7 @@ function buildAnalysisPdfHtml(params: {
 <html lang="fr">
 <head>
   <meta charset="utf-8">
-  <title>Analyse juridique — ${escapeHtml(filename)}</title>
+  <title>Analyse de contrat — ${escapeHtml(filename)}</title>
   <style>
     @page { size: A4; margin: 18mm 16mm; }
     * { box-sizing: border-box; }
@@ -485,13 +488,19 @@ export function AnalysisPage() {
       <div className="grid gap-6 lg:grid-cols-3">
         <div className="space-y-3 lg:col-span-2">
           {activeTab === 'Résumé' ? (
-            <Card padding="lg">
-              <CardHeader title="Analyse juridique" />
-              <MarkdownText
-                content={data.analysis}
-                className="text-sm text-slate-700"
-              />
-            </Card>
+            <>
+              <SynthesisSection documentId={id} />
+              <Card padding="lg">
+                <CardHeader
+                  title="Analyse générale du contrat"
+                  subtitle="Résumé, obligations, clauses clés et risques"
+                />
+                <MarkdownText
+                  content={data.analysis}
+                  className="text-sm text-slate-700"
+                />
+              </Card>
+            </>
           ) : null}
 
           {activeTab === 'Points critiques' ? (
@@ -751,6 +760,107 @@ export function AnalysisPage() {
         </div>
       </div>
     </div>
+  )
+}
+
+/**
+ * Multi-agent synthesis card shown above the legal analysis in the Résumé tab.
+ * The result is persisted and Redis-resumable: it loads instantly if already
+ * generated, and a running generation continues (and reconnects) across
+ * navigation / refresh.
+ */
+function SynthesisSection({ documentId }: { documentId: string }) {
+  const {
+    synthesis,
+    isLoadingCached,
+    isGenerating,
+    progress,
+    message,
+    error,
+    generate,
+    regenerate,
+  } = useContractSynthesis(documentId)
+
+  return (
+    <Card padding="lg">
+      <CardHeader
+        title="Synthèse multi-agents"
+        subtitle="Croise l’analyse juridique, financière et de conformité"
+        action={
+          <span className="inline-flex size-8 items-center justify-center rounded-lg bg-primary-soft text-primary">
+            <Sparkles className="size-4" />
+          </span>
+        }
+      />
+
+      {isLoadingCached ? (
+        <div className="flex items-center gap-2 py-4 text-sm text-muted">
+          <Loader2 className="size-4 animate-spin" />
+          Chargement…
+        </div>
+      ) : synthesis ? (
+        <div className="space-y-4">
+          <div className="max-h-[32rem] overflow-y-auto pr-1 scrollbar-thin">
+            <MultiAgentSynthesis synthesis={synthesis} />
+          </div>
+          <div className="flex justify-end border-t border-border pt-3">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => regenerate()}
+              disabled={isGenerating}
+              leftIcon={
+                isGenerating ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : (
+                  <RefreshCw className="size-3.5" />
+                )
+              }
+            >
+              {isGenerating ? 'Nouvelle synthèse…' : 'Régénérer la synthèse'}
+            </Button>
+          </div>
+        </div>
+      ) : isGenerating ? (
+        <div className="space-y-3 py-2">
+          <div className="flex items-center gap-2 text-sm text-slate-700">
+            <Loader2 className="size-4 animate-spin text-brand" />
+            {message || 'Synthèse multi-agents en cours…'}
+          </div>
+          <div className="h-2 w-full overflow-hidden rounded-full bg-slate-100">
+            <div
+              className="h-full rounded-full bg-brand transition-all duration-500"
+              style={{ width: `${Math.max(5, progress)}%` }}
+            />
+          </div>
+          <p className="text-xs text-muted">
+            Vous pouvez quitter cette page : la synthèse continue en arrière-plan
+            et sera enregistrée automatiquement.
+          </p>
+        </div>
+      ) : (
+        <div className="space-y-3 py-1">
+          <p className="text-sm text-muted">
+            Lancez les trois agents (juridique, financier, conformité) pour
+            obtenir une recommandation de synthèse et le détail de chaque agent.
+          </p>
+          <Button
+            size="sm"
+            onClick={() => generate()}
+            leftIcon={<Sparkles className="size-3.5" />}
+          >
+            Générer la synthèse multi-agents
+          </Button>
+        </div>
+      )}
+
+      {error ? (
+        <p className="mt-3 flex items-center gap-1.5 text-xs text-danger">
+          <AlertTriangle className="size-3.5" />
+          {error}
+        </p>
+      ) : null}
+    </Card>
   )
 }
 

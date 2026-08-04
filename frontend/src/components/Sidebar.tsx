@@ -5,6 +5,8 @@ import {
   FileText,
   Files,
   Clock,
+  GitCompareArrows,
+  ListChecks,
   Settings,
   LogOut,
   X,
@@ -17,7 +19,9 @@ const navItems = [
   { to: '/dashboard', label: 'Tableau de bord', icon: LayoutDashboard },
   { to: '/consultation', label: 'Nouvelle consultation', icon: MessageSquarePlus },
   { to: '/documents', label: 'Mes contrats', icon: FileText },
+  { to: '/comparisons', label: 'Comparer des contrats', icon: GitCompareArrows },
   { to: '/generated-documents', label: 'Documents générés', icon: Files },
+  { to: '/tasks', label: 'Tâches', icon: ListChecks },
   { to: '/history', label: 'Historique', icon: Clock },
   { to: '/settings', label: 'Paramètres', icon: Settings },
 ]

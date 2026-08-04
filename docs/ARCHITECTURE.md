@@ -8,7 +8,7 @@
 > services, endpoints, graphs/nodes, agents, frontend routes/pages, infra services, or data
 > flows). See `.cursor/rules/keep-architecture-doc-updated.mdc`.
 >
-> _Last verified: 2026-07-28 (per-contract generated documents in Analysis page)._
+> _Last verified: 2026-07-29 (contract comparison is now a persisted, Redis-resumable LangGraph workflow using full-document retrieval for both versions and a clause-by-clause risk-impact table)._
 
 ---
 
@@ -94,10 +94,12 @@ flowchart TB
 1. **Ingestion (write path, async):** Upload PDF → API stores file + row → enqueues Celery task
    → worker runs the **LangGraph ingestion graph** (parse/OCR → clean → chunk → embed → persist
    → index) → pgvector. Progress streamed to Redis, polled by UI.
-2. **Q&A (read path, async/reconnectable):** User question → API creates a Redis job → Celery
+2. **Q&A/report (read path, async/reconnectable):** User request → API creates a Redis job → Celery
    worker embeds → retrieves → reranks → calls the LLM and appends every event to Redis. The UI
    follows the event stream live and can replay it after navigation or refresh; disconnecting the
-   browser does not cancel generation.
+   browser does not cancel generation. Report mode additionally brands, renders and persists the
+   PDF inside the worker; both API and worker mount the canonical logo read-only at
+   `/brand/logo.png`.
 
 ---
 
@@ -173,8 +175,8 @@ src/
 │  ├─ ui/ (Button, Input, Card)
 │  └─ charts/ (ScoreGauge used; MonthlyBarChart/CategoryDonut/StatSparkline ⚠ unused)
 ├─ layouts/AppLayout.tsx       # shell + per-route title/subtitle layouts
-├─ pages/            # Dashboard, Documents, Consultation, Analysis, History, Settings,
-│                    #  Login  (+ Supervision.tsx, AgentDetail.tsx ✗ NOT ROUTED)
+├─ pages/            # Dashboard, Documents, GeneratedDocuments, Tasks, Consultation,
+│                    #  Analysis, History, Settings, Login
 ├─ hooks/useDocuments.ts       # React Query hooks
 ├─ services/         # api (axios), auth, documents, chat, analysis
 ├─ types/index.ts    # shared TS types
@@ -243,6 +245,7 @@ All SQL lives in `repositories/`:
 | `RetrievalRepository` | pgvector search | `search_similar(..., user_id, document_id)` and full-document loading, both joined to the owner document |
 | `ConversationRepository` | conversations/messages | Owner-scoped CRUD + history |
 | `DocumentAnalysisRepository` | persisted analyses | Get-or-compute persistence plus owner-scoped batch payload lookup for document scores |
+| `ContractComparisonRepository` | persisted contract comparisons | Latest comparison for an ordered `(base_document_id, target_document_id)` pair |
 | `UserRepository` | users | `create`, `get_by_email`, `get_by_id` |
 | `VectorRepository` | (helper) | vector-related helpers |
 
@@ -250,7 +253,7 @@ All SQL lives in `repositories/`:
 - **Services** (`app/services/`): `DocumentService`, `DocumentProcessingService`,
   `IndexingService`, `EmbeddingService`, `RetrievalService`, `RerankerService`,
   `GeneratorService`, deterministic `calculate_risk_score`, `ConversationService`, `AuthService`,
-  `IngestionProgressService`,
+  `IngestionProgressService`, `ContractComparisonService`,
   `LangfuseService`, plus helpers (`chunker`, `text_cleaner`, `prompt_builder`,
   `context_formatter`) and `llm/` provider abstraction.
 - **Routers** (`app/api/v1/endpoints/`): thin — parse request, call one service, return a schema.
@@ -321,6 +324,34 @@ PostgreSQL 16 with the **`vector`** extension. Schema is managed by Alembic
 `processing` rows prevent duplicate generation in the same API process. If the API restarts
 mid-generation, `ContractAnalysisService` recognizes rows older than the current process and
 reclaims them on the next request instead of leaving the contract permanently blocked.
+
+**`document_syntheses`** (011) — latest persisted multi-agent synthesis for each contract
+(same shape and get-or-compute/reclaim semantics as `document_analyses`, reusing the
+`analysis_status` enum).
+| Column | Type | Notes |
+|---|---|---|
+| id | UUID | PK |
+| document_id | UUID | FK→documents `ON DELETE CASCADE`, **unique indexed** |
+| status | ENUM `analysis_status` | `processing/completed/failed` |
+| payload | JSONB | `{recommendation, legal, finance, compliance, metadata}`; nullable while processing/failed |
+| synthesis_version | VARCHAR(32) | currently `1`; invalidates results after prompt/agent-set changes |
+| request_fingerprint | VARCHAR(64) | SHA-256 of generation parameters |
+| model | VARCHAR(255) | provider model used, nullable |
+| error_message | TEXT | safe failure message, nullable |
+| created_at / updated_at | TIMESTAMPTZ | server default `now()` |
+
+**`contract_comparisons`** (012) — latest persisted semantic comparison for an ordered pair
+of owned contracts.
+| Column | Type | Notes |
+|---|---|---|
+| id | UUID | PK |
+| base_document_id / target_document_id | UUID | FKs→documents `ON DELETE CASCADE`, unique pair |
+| status | ENUM `analysis_status` | `processing/completed/failed` |
+| payload | JSONB | summary, counts, clause changes, risk impacts, recommendations and metadata |
+| comparison_version | VARCHAR(32) | invalidates stale comparison payloads |
+| request_fingerprint | VARCHAR(64) | SHA-256 of version and ordered document pair |
+| model / error_message | VARCHAR/TEXT | provider model and safe failure |
+| created_at / updated_at | TIMESTAMPTZ | server default `now()` |
 
 **`document_chunks`** (004) — semantic chunks.
 | Column | Type | Notes |
@@ -557,7 +588,11 @@ Shared state helpers in `_state_utils.py`.
   killing the run); the shared retry policy still covers transient failures. `LegalNode`/`FinanceNode`/
   `ComplianceNode` share one injected `GeneratorService` (reusing the RAG pipeline with a specialized
   system prompt each); `SynthesisNode` reuses the existing LLM provider to cross-reference the three
-  analyses into `final_recommendation` (it never re-runs retrieval and adds no new facts).
+  analyses into `final_recommendation` (it never re-runs retrieval and adds no new facts). The same
+  graph has two consumers: the Consultation slash commands (`/agents/query` · `/agents/stream`) and
+  `ContractSynthesisService`, which invokes it in default (multi) mode scoped to one contract and
+  **persists** the `{recommendation, legal, finance, compliance}` result in `document_syntheses`
+  for the Analysis page (durable, Redis-resumable via `synthesis.generate`).
 - **Selected-agent scope guard:** when `target_agent` is set by an explicit slash command,
   `DomainGuardService` checks the command-stripped question against multilingual legal, finance and
   compliance signals before retrieval. An out-of-domain request returns `status=out_of_scope`, a
@@ -592,10 +627,11 @@ JSON equivalent. Plain messages (no slash) still use `/chat/stream`.
 | **Provider factory** | `get_llm_provider` — env-driven registry (`services/llm/factory.py`). `LLM_PROVIDER` selects the provider; the API key resolves from a provider-specific env var (`OPENAI_API_KEY`/`GROQ_API_KEY`/`NVIDIA_API_KEY`/`OPENROUTER_API_KEY`) then falls back to generic `LLM_API_KEY`. Adding a provider = one registry entry | — |
 | **Conversation memory** | `ConversationService` — persists messages; `load_history` (limit `CONVERSATION_HISTORY_LIMIT=10`) injected into prompt (history loaded *before* current turn) | Feeds `GeneratorService.answer_question(history=...)` |
 | **Multi-Agent graph** | `build_multi_agent_graph` (LangGraph `StateGraph`) — `CommandParserNode` routes a `/legal\|/finance\|/compliance` command to a single agent node, else chains `LegalNode → FinanceNode → ComplianceNode → SynthesisNode`. Real graph nodes + conditional edges (no external Python dispatch) | Blocking `POST /agents/query` |
-| **Multi-Agent streaming** | `AgentStreamService` (`services/agent_stream.py`) — SSE counterpart used by the Consultation slash commands. A selected agent first passes `DomainGuardService`; out-of-scope requests stream a refusal without retrieval/LLM. Accepted single agents reuse `stream_answer`; `/synthese` runs three `answer_question` calls then a streamed synthesis. Every accepted specialist/synthesis uses `AGENT_MAX_TOKENS` (8192 by default), independently of the shorter chat budget. | `POST /agents/stream` — Consultation **slash commands** (fragmented) |
-| **Legal/Finance/Compliance nodes** | `LegalNode`/`FinanceNode`/`ComplianceNode` (`agents/nodes/`, share `DomainAgentNode`) — each enforces the selected-agent domain boundary, then reuses the injected `GeneratorService` RAG pipeline with its specialized system prompt; writes `{legal,finance,compliance}_result` on the state | Multi-agent graph nodes |
+| **Multi-Agent streaming** | `AgentStreamService` (`services/agent_stream.py`) — SSE counterpart used by the Consultation slash commands. A selected agent first passes `DomainGuardService`; out-of-scope requests stream a refusal without retrieval/LLM. Accepted single agents reuse `stream_answer`; `/synthese` runs three `answer_question` calls then a streamed synthesis. Every accepted specialist/synthesis uses `AGENT_MAX_TOKENS` (8192 by default), independently of the shorter chat budget. **Retrieval:** bare `/legal\|/finance\|/compliance` (no user text) with a scoped `document_id` uses full-document retrieval (`get_document_chunks`); an explicit follow-up question keeps Top-K. Decision is centralized in `GeneratorService._resolve_answer_chunks` via `is_default_question` (not duplicated in the stream service). | `POST /agents/stream` — Consultation **slash commands** (fragmented) |
+| **Legal/Finance/Compliance nodes** | `LegalNode`/`FinanceNode`/`ComplianceNode` (`agents/nodes/`, share `DomainAgentNode`) — each enforces the selected-agent domain boundary, then reuses the injected `GeneratorService` RAG pipeline with its specialized system prompt; writes `{legal,finance,compliance}_result` on the state. `CommandParserNode` sets `metadata.is_default_question`; the node passes that flag through so bare commands use full-document retrieval when a contract is scoped | Multi-agent graph nodes |
 | **Domain guard** | `DomainGuardService` wraps the multilingual deterministic detector in `agents/intent.py`; returns detected domains/keywords and a safe business message. It classifies scope only and does not perform graph routing. | Blocking graph nodes + streaming single-agent path |
-| **SynthesisNode** | `agents/nodes/synthesis_node.py` — reads the three result fields and calls the LLM provider with `SYNTHESIS_SYSTEM_PROMPT` to weigh/cross-reference them into `final_recommendation` (no retrieval, no new facts) | Multi-agent graph fan-in |
+| **SynthesisNode** | `agents/nodes/synthesis_node.py` — reads the three result fields and calls the LLM provider with `SYNTHESIS_SYSTEM_PROMPT` to weigh/cross-reference them into `final_recommendation` (no retrieval, no new facts). Uses a large completion budget (`synthesis_max_tokens`, default 12000) and, if the model still stops on `length`, performs up to `synthesis_max_continuations` (default 2) continuation rounds so the cross-disciplinary recommendation is never cut off mid-section; flags `truncated` in metadata as a last resort | Multi-agent graph fan-in |
+| **Contract comparison graph** | `build_comparison_graph` (`graphs/comparison_graph.py`) contains a true `ComparisonNode`. The node is a thin wrapper over `ContractComparisonService`, which owner-checks both documents, loads all ordered chunks with `get_document_chunks`, allocates half of `COMPARISON_CONTEXT_CHARS` to each version, and produces structured clause-level additions/removals/modifications/unchanged rows with risk impact. Results persist in `contract_comparisons`; Celery/Redis make execution resumable | `/comparisons`, `comparison.generate` |
 | **LegalAgent** | `LegalAgent.analyze` — `GeneratorService.analyze_contract` (structured JSON: summary/risk/critical points/missing info/recommendations, full-document grounded) with `RuleBasedRiskClassifier` fallback. `calculate_risk_score` deterministically converts all deduplicated findings into a cumulative 0–100 score. `ContractAnalysisService` wraps it with get-or-compute persistence in `document_analyses`; cache identity uses document + analysis version + request fingerprint | `POST /agents/legal/analyze` (used by Analysis page) |
 
 **Risk score formula (`services/risk_score.py`):** exact duplicate findings are counted once. The
@@ -675,9 +711,10 @@ foreign UUID returns `404`.
 |---|---|---|---|---|
 | POST `/chat/query` | `ChatQueryRequest{question, document_id?, top_k?, final_k?, temperature?, max_tokens?}` | `ChatQueryResponse{answer, sources[], metadata}` | `build_rag_graph` → nodes | pgvector SELECT; LLM |
 | POST `/chat/stream` | `ChatQueryRequest` | **SSE** events `data:{type:sources\|delta\|done\|error}` | `GeneratorService.stream_answer` | pgvector SELECT; LLM stream |
-| POST `/chat/jobs` | `ChatJobCreateRequest{mode:"chat"\|"agent", question, document_id?, ...}` | `202 {job_id,status:"queued"}` | Redis `ChatJobStore` → Celery `chat.generate` | Redis; worker later uses pgvector/LLM |
-| GET `/chat/jobs/{job_id}` | — | `{job_id,mode,status,event_count}` | owner-checked `ChatJobStore` | Redis |
+| POST `/chat/jobs` | `ChatJobCreateRequest{mode:"chat"\|"agent"\|"report", question, document_id?, conversation_id?, ...}` | `202 {job_id, status:"queued", conversation_id}` | creates/reuses a SQL conversation + persists the **user** `messages` row, then Redis `ChatJobStore` → Celery `chat.generate` (which persists the **assistant** `messages` row on completion) | INSERT `conversations`/`messages`; Redis; worker later uses pgvector/LLM |
+| GET `/chat/jobs/{job_id}` | — | `{job_id,mode,status,event_count,created_at}` (`created_at` lets the UI resume the elapsed timer from the real queue time) | owner-checked `ChatJobStore` | Redis |
 | GET `/chat/jobs/{job_id}/stream?after=N` | — | replayable **SSE** event stream until terminal status | owner-checked `ChatJobStore` | Redis event list |
+| POST `/chat/jobs/{job_id}/cancel` | — | terminal job status `cancelled` | owner check → Celery revoke/terminate → `ChatJobStore.mark_cancelled` | Redis + Celery control |
 | POST `/chat/document` | `ChatQueryRequest` | `ChatDocumentResponse{html, generated_document_id, sources[], metadata}` — the PDF is rendered and persisted before this response, without waiting for a download click | `GeneratorService.generate_document` → `render_html_to_pdf` → `GeneratedDocumentService.save_pdf` | pgvector SELECT; LLM; INSERT `generated_documents`; file → `storage/generated` |
 | POST `/chat/document/pdf` | `{html, filename?, title?, source_document_id?, kind?, question?}` | PDF attachment + `X-Generated-Document-Id`; every rendered PDF is persisted before download | `render_html_to_pdf` → `GeneratedDocumentService.save_pdf` | INSERT `generated_documents`; file → `storage/generated` |
 | POST `/chat/conversations` | `{title?}` | `201 ConversationResponse` | `ConversationService.create_conversation` | INSERT |
@@ -694,6 +731,16 @@ foreign UUID returns `404`.
 | POST `/agents/legal/analyze` | `LegalAnalyzeRequest{question, document_id?, conversation_id?, force_refresh=false, ...}` | `LegalAnalysisResponse{analysis, risk_level, risk_score, missing_information[], sources[], recommendations[], metadata}`; scoped calls return a matching stored result immediately, otherwise calculate and persist it | `ContractAnalysisService.get_or_analyze` → `LegalAgent.analyze` → deterministic score on cache miss | SELECT/UPSERT `document_analyses`; pgvector + LLM only on miss/refresh |
 | POST `/agents/legal/analyze/jobs` | `LegalAnalysisJobRequest` (owned `document_id` required) | `202 {job_id,document_id,status:"queued"}` | Redis `AnalysisJobStore` → Celery `analysis.generate` | Redis + background DB/LLM work |
 | GET `/agents/legal/analyze/jobs/{job_id}` | — | owner-scoped `{status,progress,message,result?,error?}` | `AnalysisJobStore.get_for_user` | Redis |
+| GET `/agents/synthesis/{document_id}` | — | `AgentSynthesisResult{recommendation, legal, finance, compliance, metadata}` or `404` if none generated yet (never computes) | `ContractSynthesisService.get_cached` | SELECT `document_syntheses` |
+| POST `/agents/synthesis/jobs` | `SynthesisJobRequest` (owned `document_id` required) | `202 {job_id,document_id,status:"queued"}` | Redis synthesis `AnalysisJobStore` → Celery `synthesis.generate` | Redis + background DB/LLM work |
+| GET `/agents/synthesis/jobs/{job_id}` | — | owner-scoped `{status,progress,message,result?,error?}` | synthesis `AnalysisJobStore.get_for_user` | Redis |
+
+### Contract comparisons (protected)
+| Method / URL | Request | Response | Service | DB |
+|---|---|---|---|---|
+| GET `/comparisons?base_document_id=&target_document_id=` | owned ordered pair | cached `ContractComparisonResult` or 404 (never computes) | `ContractComparisonService.get_cached` | SELECT `contract_comparisons` |
+| POST `/comparisons/jobs` | `{base_document_id,target_document_id,force_refresh?}` | `{job_id,...,status:"queued"}` | `ComparisonJobStore` → Celery `comparison.generate` → `build_comparison_graph` | Redis + full-document pgvector rows + LLM + UPSERT result |
+| GET `/comparisons/jobs/{job_id}` | — | owner-scoped progress/result/error | `ComparisonJobStore.get_for_user` | Redis |
 
 ### Generated documents (protected)
 | Method / URL | Request | Response | Service | Storage |
@@ -701,6 +748,12 @@ foreign UUID returns `404`.
 | GET `/generated-documents` | `source_document_id?, skip, limit` | owner-scoped `GeneratedDocumentListResponse` | `GeneratedDocumentService.list_documents` | SELECT `generated_documents` |
 | GET `/generated-documents/{id}/file` | `download?` | inline/attachment PDF | `GeneratedDocumentService.get_document` | DB ownership check + `storage/generated` |
 | DELETE `/generated-documents/{id}` | — | `204` | `GeneratedDocumentService.delete_document` | DELETE row + PDF file |
+
+### Task center (protected)
+| Method / URL | Request | Response | Service | Storage |
+|---|---|---|---|---|
+| GET `/tasks` | — | owner-scoped recent ingestion/chat/agent/report/analysis/synthesis/comparison tasks with status, progress and destination | `TaskCenterService.list_for_user` | Redis job hashes including `comparison:job:*` and ingestion progress records |
+| POST `/tasks/{task_id}/cancel` | `{ type }` | `{ status: "cancelled" }` | `TaskCenterService.cancel` — owner check → Celery revoke/terminate → mark the owning store (including comparison) `cancelled` | Redis + Celery control |
 
 **Typical flow example (`/chat/stream`):** endpoint → `GeneratorService.stream_answer` →
 `_retrieve_and_rerank` (embed → pgvector → CrossEncoder) → `_prepare_prompt` → yields `sources`,
@@ -777,25 +830,115 @@ professional, non-technical payload and **never** a stack trace or internal deta
   and hard-redirects to `/login` (except `/auth/*`).
 - **Services:** `auth.ts` (`/auth/*`), `documents.ts` (`/documents*`), `chat.ts` (`askQuestion`
   ⚠ unused, `streamQuestion` SSE via `fetch`), `analysis.ts` (`/agents/legal/analyze`, including
-  explicit `force_refresh`).
+  explicit `force_refresh`), `synthesis.ts` (`/agents/synthesis*` — cached peek + durable job
+  start/poll), `comparisons.ts` (`/comparisons*` — cached peek + durable job start/poll),
+  `agents.ts` (`/agents/query`, `/agents/stream`).
 - **Hooks (`useDocuments.ts`):** `useDocuments`, `useRecentActivity`, `useLegalAnalysis(id)`
   (backend-persisted get-or-compute result), `useRefreshLegalAnalysis(id)` (explicit recompute),
   `useUploadDocument`, `useDocumentProgress(id)` (polls every 1.5s until terminal). The legal
   analysis query key includes the score-version number so a scoring revision cannot reuse stale
-  browser data.
+  browser data. `useSynthesis.ts` exposes `useContractSynthesis(id)` for the multi-agent synthesis.
+- **Contract comparison page (`/comparisons`):** two selectors choose an indexed reference
+  contract and a target version; either slot can also upload a PDF and follows the existing live
+  ingestion pipeline before selecting it automatically. `useContractComparison` resumes an account/pair-scoped Redis job
+  after navigation/refresh and renders an executive summary, change counts, a scrollable
+  clause-by-clause additions/removals/modifications table with risk impact, and recommendations.
+  Task Center follow links preserve both IDs as `?base=...&target=...`, so the page rehydrates the
+  selected pair and resumes the corresponding job instead of returning to an empty selector.
 - **Durable Analysis page:** `useLegalAnalysis` starts `analysis.generate` through the job API,
   stores its job id under an account/document-scoped localStorage key, and polls Redis. Navigation
   or refresh aborts only the browser poll, never the Celery task; reopening the same contract
   resumes that job and receives its stored structured result. Explicit refresh replaces the job id.
+- **Multi-agent synthesis (Analysis → Résumé tab):** above the legal analysis, a
+  `MultiAgentSynthesis` card shows the synthesis agent's recommendation plus the three individual
+  agent analyses (juridique/financier/conformité) as collapsible detail, exactly like the chat.
+  `useContractSynthesis(id)` first peeks the cached result (`GET /agents/synthesis/{id}` → instant,
+  never recomputes); if none, a **Générer** button starts a durable `synthesis.generate` job
+  (`ContractSynthesisService.get_or_synthesize` runs `build_multi_agent_graph` scoped to the
+  contract and persists the result in `document_syntheses`). The job id is stored under an
+  account/document localStorage key; leaving/refreshing aborts only the browser poll, and remount
+  auto-resumes the unfinished job. **Régénérer** forces a recompute.
+- **Task center:** `/tasks` polls an owner-scoped unified view of document preparation, chat,
+  specialist, report, analysis and multi-agent synthesis jobs. Analysis vs synthesis are classified
+  from the **Redis key prefix** (`analysis:job:*` vs `synthesis:job:*`), not a stored field, so jobs
+  created before the `kind` column existed are still labelled — and therefore cancellable — correctly.
+  While listing, orphaned in-flight jobs (still `queued`/`processing` but with an `updated_at` older
+  than 15 min — their worker died on a restart/deploy) are reaped in place to `failed` and their
+  active-job index is released, so they stop blocking the "En cours" list and new runs. It separates
+  active/completed/all tasks,
+  displays progress,
+  and links back to Documents, Consultation or the relevant Analysis page. Every newly uploaded
+  document is registered at queue time with its owner and filename; LangGraph stage updates provide
+  its live progress. Ingestion follow links include `?upload={document_id}`; the Documents page
+  reconstructs the matching `IngestionProgress` after navigation instead of relying only on local
+  component state. Generation mode uses a durable `mode:"report"` job, so report creation also
+  survives navigation and replays into the saved conversation. Each active task exposes an **Arrêter**
+  button that calls `POST /tasks/{task_id}/cancel` with its type; `TaskCenterService.cancel`
+  dispatches to the owning store (chat/agent/report, analysis/synthesis, or ingestion), revokes the
+  Celery task and flips its Redis state to `cancelled`.
+- **Analysis job idempotency:** Redis maintains one active-job index per
+  `(user_id, document_id)`, protected by a short distributed lock. Concurrent starts—including
+  navigation races and development double-invocations—reuse the same job id instead of enqueueing
+  another Celery task. A stale in-flight job (no state change for 15 min → its worker died) is **not**
+  reused: idempotency treats it as dead, releases the index and starts a fresh job. The task center collapses legacy active duplicates to the most advanced
+  entry and groups terminal analyses of the same document created within five seconds (the same UI
+  action); deliberate later re-analyses remain visible. Terminal completion/failure releases the
+  active index safely.
+- **Generation cancellation:** while a durable chat, specialist or report job is active,
+  Consultation replaces “Envoyer” with “Arrêter”, and the Tasks page shows an **Arrêter** button on
+  every active task (any type). The protected cancellation endpoint verifies ownership, revokes/
+  terminates the Celery task and flips the owning Redis store to `cancelled`. Because analysis/
+  synthesis/ingestion tasks run with `acks_late=True` (a revoked task may be redelivered), the
+  cancellation is **cooperative and idempotent**: each worker short-circuits at entry when its job is
+  already `cancelled`, and every terminal/stage write (`mark_processing`/`mark_completed`/`mark_failed`/
+  `report_stage`) refuses to resurrect a cancelled job. Late chat completion/error events are likewise
+  ignored once the replayable `cancelled` event exists.
+- **Database-backed chat history:** every `/chat/jobs` turn (chat, specialist agent, report) is
+  durably persisted in PostgreSQL. Sending the first message lazily creates a SQL conversation
+  (`POST /chat/conversations`, untitled) then, at job creation, the endpoint derives a human title
+  from the first message (`_derive_conversation_title`, leading `/command` stripped) via
+  `ConversationService.ensure_title` — so the sidebar never shows a generic "Nouvelle conversation"
+  — and stores the user `messages` row immediately; the Celery task stores the assistant reply (content + `metadata.sources`,
+  `metadata.generation`, `metadata.agent_label`/`agent_domain`/`agent_analyses`,
+  `metadata.generated_document_id`) when generation finishes. The Consultation sidebar reads the
+  real conversation list via `useConversationList()` (`services/conversations.ts` maps stored
+  metadata back into `ChatMessage`s), opening a conversation fetches its messages from the server,
+  and deletion calls `DELETE /chat/conversations/{id}`. History therefore follows the user across
+  browsers/devices and outlives the 24h Redis event TTL. (`localStorage` now only holds the
+  last-open conversation id and a per-`(user,conversation)` pending-job id for live resume.)
+- **Navigation-safe continuation:** Consultation stores the active conversation id per account
+  (and, per `(user, conversation)`, the id of any still-running background job). Returning to the
+  page reloads the conversation's messages from PostgreSQL; if a pending job is still
+  queued/processing it reconnects via `/chat/jobs/{id}/stream`, appends the live reply with a
+  "Reprise en cours" indicator (report jobs, which emit no fragments until the PDF is ready, show
+  an explicit "génération en arrière-plan" note), and resumes the elapsed chrono from the job's
+  real `created_at` (never from zero). If the job already finished while away, the conversation is
+  re-fetched so the durably-persisted reply is shown. When the resume stream ends the durable
+  status is re-checked: a still-running job keeps its pending marker (a later refresh resumes it
+  again), a terminal job is reconciled against the persisted reply so the final message — including
+  any generated PDF — is always authoritative. Completed generations never restart.
+- **Switch conversations mid-generation:** starting a new conversation or opening another one is
+  allowed even while a reply is streaming. The local SSE reader is detached via an `AbortController`
+  (the durable Celery/Redis job keeps running and its `(user, conversation)` pending marker is kept),
+  so the abandoned generation finishes in the background, is persisted, is visible in the Tasks page,
+  and is resumed/reconciled when the user returns to that conversation. `streamBackgroundChatJob`
+  treats an aborted fetch/read as a clean stop (no error surfaced), and each send/resume guards its
+  post-stream cleanup so a switch never clears the pending marker of the still-running job.
+- **Persisted report preview:** a report reloaded from history keeps only its
+  `generated_document_id` (not the inline HTML), so `DocumentCard` fetches the stored PDF blob and
+  previews it in an iframe instead of showing "Aperçu indisponible".
 - **State management:** React Query for server state (keys `['documents']`, `['activity']`,
-  `['legal-analysis', id]`, `['document-progress', id]`); local `useState` per page; no
-  Redux/Zustand. Consultation history is persisted per account under
-  `legallink.conversations.v2.<user-id>`; no account reads the former global key or another
-  account's local history. Assistant placeholders retain the Redis `backgroundJobId`; reopening a
-  conversation replays stored fragments and follows the same job until completion.
-- **Pages:** Dashboard/Documents/GeneratedDocuments/History/Analysis/Settings/Login/Consultation are **wired to the
+  `['legal-analysis', id]`, `['document-progress', id]`, `['chat-conversations']`); local `useState`
+  per page; no Redux/Zustand. Server query caches are cleared on account changes so no account sees
+  another's data.
+- **Pages:** Dashboard/Documents/GeneratedDocuments/Tasks/History/Analysis/Settings/Login/Consultation are **wired to the
   backend**; `mock.ts` is largely unused (only chat `suggestions`); some chart components and the
   History period filter are cosmetic.
+- **Operational Dashboard:** combines owner-scoped `useDocuments()` data with the live `useTasks()`
+  feed. Its linked indicators expose portfolio size, analysis coverage, high-risk contracts and
+  active work. The risk panel uses persisted scores (`<50` high, `50–79` moderate, `≥80` low),
+  keeps unanalysed contracts separate and links to real Documents, History and Tasks screens; no
+  mock analytics or synthetic trends are displayed.
 - **Generated PDF library:** `/generated-documents` lists every owner-scoped PDF exported from a
   consultation or analysis, with view/download/delete actions. `?contractId=<uuid>` filters the
   library to one source contract; each row in “Mes contrats” links directly to that filtered view.
@@ -814,8 +957,25 @@ professional, non-technical payload and **never** a stack trace or internal deta
 - **Explicit consultation mode:** the composer exposes a segmented **Conversation / Génération
   PDF** control. Conversation mode always uses chat/agents and refuses file-generation wording with
   a human-readable instruction to switch modes; it never creates a PDF implicitly. Génération PDF
-  mode sends every request through `/chat/document`, regardless of wording, then automatically
-  persists the branded PDF. Slash-agent selection is available only in Conversation mode.
+  mode sends every request through the durable `mode:"report"` job, regardless of wording, then
+  automatically persists the branded PDF.
+- **Slash agents in both modes:** the agent picker (`/legal`, `/finance`, `/compliance`,
+  `/synthese`, incl. FR aliases `/juridique`, `/financier`, `/conformité`) is available in *both*
+  modes. In Conversation mode it streams a specialist/synthesis text answer (`mode:"agent"` →
+  `AgentStreamService`). In Génération PDF mode the SAME command produces a **domain-specialised
+  PDF**: the frontend keeps the leading token in the request, and `ReportGenerationService.
+  resolve_report_request` strips it, selects a per-domain focus lens + report title
+  (Rapport juridique / financier / de conformité / de synthèse) and passes `report_focus` to
+  `GeneratorService.generate_document`. The focus only sets the analytical angle; the HTML format
+  and the reproducible global-risk-score method stay the single source of truth in
+  `DOCUMENT_SYSTEM_INSTRUCTIONS`. Retrieval mode is unchanged (full-document when one contract is
+  selected, Top-K library-wide otherwise). **Scope guard also applies to PDF generation:** before
+  generating, `ReportGenerationService` runs `DomainGuardService` on the command-stripped question
+  for the three specialist domains (`/legal`, `/finance`, `/compliance`; the cross-disciplinary
+  `/synthese` is never guarded). An out-of-domain request (e.g. `/legal` + a purely financial ask)
+  returns `status="out_of_scope"` — **no PDF is produced** — and the assistant reply is the
+  human-readable redirection to the correct command (the sync `/chat/document` endpoint returns
+  `422` with the same message).
 - **Business-language output:** shared chat/document prompts and every specialist/synthesis prompt
   explicitly prohibit exposing implementation vocabulary (`chunk`, RAG, embeddings, vectors,
   retrieval/reranking, prompts, tokens, context windows, model/provider/API/pipeline/database).
@@ -1036,8 +1196,6 @@ React component polls.
   is not concurrency-safe; true parallelism would need per-agent sessions.
 - RAG-graph `EmbeddingNode` is a structural no-op for queries.
 - Frontend `DocumentItem.type`/`agents` are **hardcoded placeholders** in `documents.ts`.
-- Streaming chat is kept in account-partitioned browser history, but streamed turns are **not yet
-  persisted in backend `messages`**; the separate conversation API supports DB persistence.
 - History "period" filter and Consultation paperclip are non-functional UI.
 - Settings profile is read-only (no update endpoint).
 
@@ -1057,13 +1215,26 @@ React component polls.
   The former keyword detector is retained only behind `DomainGuardService` for pre-generation scope
   validation; it no longer dispatches agents.
 - ✓ Explicit specialist commands refuse out-of-domain questions before retrieval or provider calls,
-  while `/synthese` keeps its intended cross-domain behavior.
+  in **both** Conversation streaming and Génération PDF (no PDF is produced on refusal), while
+  `/synthese` keeps its intended cross-domain behavior.
 - ✓ Per-user isolation: migration 009 owns documents/conversations; endpoint, service, repository,
   full-document and library-wide RAG paths are JWT-owner scoped; foreign UUIDs return `404`.
   Frontend query caches are cleared on account changes and local chat history is partitioned by
   user id. A/B regression tests cover direct-resource and retrieval IDOR boundaries.
 - ✓ Resumable chat: normal and slash-agent questions run as independent Celery jobs; Redis retains
-  owner-scoped event history for 24 hours and Consultation reconnects from its persisted job id.
+  owner-scoped event history for 24 hours and Consultation reconnects from its persisted job id and
+  last consumed event cursor without resetting the visible response.
+- ✓ Database-backed chat history: every `/chat/jobs` turn now persists the user message (at enqueue
+  time) and the assistant reply with its sources/generation/agent metadata (on completion) into the
+  SQL `conversations`/`messages` tables. The Consultation sidebar, open-conversation and delete
+  actions are backed by `/chat/conversations*`, so history survives across browsers/devices and
+  outlives the 24h Redis TTL.
+- ✓ Active chat, specialist and report generations can be stopped from Consultation; cancellation
+  is enforced in Celery and persisted in Redis rather than being a visual-only interruption.
+- ✓ Unified task center for ingestion, chat, specialist, report, analysis and synthesis jobs; report
+  generation itself is Celery-backed, automatically persisted and reconnectable.
+- ✓ Contract-analysis starts are idempotent per user/document while a job is queued or processing;
+  duplicate active cards and duplicate worker execution are prevented.
 - ✓ Generated PDFs are persisted outside chat in an owner-scoped library and can be filtered by
   their source contract.
 - ✓ Contract analysis is a reconnectable Celery job with owner-scoped Redis status/result storage;
@@ -1100,8 +1271,6 @@ React component polls.
 - Multi-agent graph (`/agents/query`) is real LangGraph, wired into Consultation via slash commands;
   agents run sequentially (single-session constraint).
 - RAG graph used only by `/chat/query`; UI uses direct streaming.
-- Conversation messages remain browser-local; Redis job events expire after 24 hours and are not a
-  permanent server-side conversation archive.
 - Generic `GraphBuilder` (stub).
 
 **✗ Not implemented**
@@ -1112,8 +1281,10 @@ React component polls.
 - Profile update, Supervision/AgentDetail pages, analytics charts wired to real data.
 
 **Recommended next steps (logical order):**
-1. **Unify chat persistence** — write completed Redis job results into the SQL conversation/message
-   tables so history follows users across devices and outlives the 24-hour event TTL.
+1. ✓ **Unify chat persistence** — done: `/chat/jobs` writes the user message at enqueue time and the
+   Celery task writes the assistant reply (with sources/generation/agent metadata) into the SQL
+   `conversations`/`messages` tables, and the Consultation history sidebar is backed by
+   `/chat/conversations*`. History now follows users across devices and outlives the 24h event TTL.
 2. **Multi-agent UI** — done for Consultation (slash commands + synthesis with the 3 detailed
    analyses). Remaining: surface it on the Analysis page too if useful.
 3. **Harden production config** — real `JWT_SECRET`, scoped CORS, secrets management.

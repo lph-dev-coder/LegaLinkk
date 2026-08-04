@@ -26,6 +26,10 @@ async def _analyze(
     payload: dict[str, Any],
 ) -> dict[str, Any]:
     store = get_analysis_job_store()
+    # A revoked acks_late task may be redelivered; stop before doing any work.
+    if await store.is_cancelled(job_id):
+        logger.info("Analysis job already cancelled, skipping job_id=%s", job_id)
+        return {"job_id": job_id, "status": "cancelled"}
     await store.mark_processing(job_id)
     owner_id = UUID(user_id)
     document_id = UUID(str(payload["document_id"]))

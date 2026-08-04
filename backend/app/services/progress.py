@@ -85,19 +85,29 @@ class IngestionProgressService:
 
     # --- writes --------------------------------------------------------------
 
-    async def mark_queued(self, document_id: str, task_id: str | None) -> None:
+    async def mark_queued(
+        self,
+        document_id: str,
+        task_id: str | None,
+        *,
+        user_id: str,
+        title: str,
+    ) -> None:
         label, progress = STAGE_INFO["queued"]
         await self._write(
             document_id,
             {
                 "document_id": document_id,
                 "task_id": task_id,
+                "user_id": user_id,
+                "title": title.strip()[:255],
                 "status": "queued",
                 "stage": "queued",
                 "stage_label": label,
                 "progress": progress,
                 "message": "Your document is queued for processing…",
                 "error": None,
+                "created_at": _now_iso(),
                 "updated_at": _now_iso(),
                 "timeline": [{"stage": "queued", "label": label, "at": _now_iso()}],
             },
@@ -113,6 +123,8 @@ class IngestionProgressService:
         label, progress = info
 
         current = await self._read(document_id) or {}
+        if current.get("status") == "cancelled":
+            return
         timeline = list(current.get("timeline") or [])
         timeline.append({"stage": stage, "label": label, "at": _now_iso()})
 
@@ -133,9 +145,17 @@ class IngestionProgressService:
         )
         logger.info("Stage %s (%s) document_id=%s", stage, label, document_id)
 
+    async def is_cancelled(self, document_id: str) -> bool:
+        """Whether ingestion was cancelled — used to short-circuit worker reruns."""
+        current = await self._read(document_id) or {}
+        return current.get("status") == "cancelled"
+
     async def mark_completed(
         self, document_id: str, *, extra: dict[str, Any] | None = None
     ) -> None:
+        # Never resurrect a preparation the user has cancelled.
+        if await self.is_cancelled(document_id):
+            return
         label, progress = STAGE_INFO["completed"]
         current = await self._read(document_id) or {}
         payload = {
@@ -157,6 +177,8 @@ class IngestionProgressService:
     async def mark_failed(
         self, document_id: str, error: str, *, stage: str | None = None
     ) -> None:
+        if await self.is_cancelled(document_id):
+            return
         label, _ = STAGE_INFO["failed"]
         current = await self._read(document_id) or {}
         await self._write(
@@ -174,6 +196,24 @@ class IngestionProgressService:
             },
         )
         logger.error("Ingestion failed document_id=%s error=%s", document_id, error)
+
+    async def mark_cancelled(self, document_id: str) -> None:
+        current = await self._read(document_id) or {}
+        await self._write(
+            document_id,
+            {
+                **current,
+                "document_id": document_id,
+                "status": "cancelled",
+                "stage": "cancelled",
+                "stage_label": "Annulée",
+                "progress": current.get("progress", 100),
+                "message": "Préparation arrêtée à votre demande.",
+                "error": None,
+                "updated_at": _now_iso(),
+            },
+        )
+        logger.info("Ingestion cancelled document_id=%s", document_id)
 
     # --- reads ---------------------------------------------------------------
 

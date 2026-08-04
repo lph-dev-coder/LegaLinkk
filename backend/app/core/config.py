@@ -100,6 +100,16 @@ class Settings(BaseSettings):
     llm_max_tokens: int = 1024
     # Specialist analyses are intentionally more exhaustive than normal chat.
     agent_max_tokens: int = 8192
+    # The multi-agent synthesis cross-references the three specialist analyses,
+    # so it needs the most room of any single completion to avoid truncation.
+    synthesis_max_tokens: int = 12000
+    # Extra completion rounds allowed to finish a synthesis that hit the token
+    # limit (continuation). 0 disables continuation (only flag truncation).
+    synthesis_max_continuations: int = 2
+    # Clause-by-clause two-contract comparison. The combined prompt splits this
+    # character budget equally between version A and version B.
+    comparison_context_chars: int = 180000
+    comparison_max_tokens: int = 12000
     # Completion budget for the document-generation mode (full HTML reports:
     # per-article analysis + recommendations + risk-score note). Much larger than
     # a chat reply so long reports are not truncated mid-section.
@@ -136,6 +146,12 @@ class Settings(BaseSettings):
     # contracts fit in one call. Documents larger than this are processed in
     # ordered batches (map) and then synthesised into the final report (reduce).
     full_document_context_chars: int = 200000
+    # Soft size cap for agent default/global analyses that use full-document
+    # retrieval. Above this character count we fall back to Top-K with an
+    # elevated final_k, so a very large contract does not blow LLM cost/latency.
+    agent_full_document_max_chars: int = 80000
+    # final_k used when the full-document agent path falls back to Top-K.
+    agent_full_document_fallback_final_k: int = 20
     rag_no_answer_message: str = (
         "I cannot answer this question based on the uploaded documents."
     )

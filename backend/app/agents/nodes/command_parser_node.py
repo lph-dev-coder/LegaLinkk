@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 
 from app.agents.base_agent import BaseGraphAgent
+from app.agents.nodes._state_utils import ensure_metadata
 from app.core.logging import get_logger
 from app.state.graph_state import GraphState
 
@@ -50,19 +51,32 @@ class CommandParserNode(BaseGraphAgent):
         raw = (state.get("user_query") or state.get("user_question") or "").strip()
         match = _COMMAND_RE.match(raw)
 
+        metadata = ensure_metadata(state)
         if match:
             domain = match.group(1).lower()
             remainder = (match.group(2) or "").strip()
             state["target_agent"] = domain  # "legal" | "finance" | "compliance"
             state["user_query"] = remainder or _DEFAULT_QUESTIONS[domain]
+            # Bare "/finance" (no user text) → default question → full-document
+            # retrieval when a contract is scoped. Explicit text stays Top-K.
+            metadata["is_default_question"] = not bool(remainder)
             logger.info(
-                "[multi_agent] command detected target=%s has_text=%s",
+                "[multi_agent] command detected target=%s has_text=%s "
+                "is_default_question=%s",
                 domain,
                 bool(remainder),
+                metadata["is_default_question"],
             )
         else:
             state["target_agent"] = None
             state["user_query"] = raw
-            logger.info("[multi_agent] no command → running all agents")
+            # Preserve an upstream flag (e.g. ContractSynthesisService sets
+            # is_default_question=True for global analysis); otherwise False.
+            metadata.setdefault("is_default_question", False)
+            logger.info(
+                "[multi_agent] no command → running all agents "
+                "is_default_question=%s",
+                metadata.get("is_default_question"),
+            )
 
         return state

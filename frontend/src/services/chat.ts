@@ -113,9 +113,21 @@ export interface StreamHandlers {
 export interface BackgroundChatJob {
   jobId: string
   status: 'queued'
+  conversationId: string
+}
+
+export interface BackgroundChatJobStatus {
+  jobId: string
+  mode: 'chat' | 'agent' | 'report'
+  status: 'queued' | 'processing' | 'completed' | 'failed' | 'cancelled'
+  eventCount: number
+  /** ISO queue time — lets the UI resume the elapsed timer from the real start. */
+  createdAt: string | null
 }
 
 export interface BackgroundJobHandlers extends StreamHandlers {
+  onEvent?: (eventCount: number) => void
+  onCancelled?: (message: string) => void
   onAgent?: (payload: {
     mode: 'single' | 'multi'
     domain?: string
@@ -132,46 +144,91 @@ export interface BackgroundJobHandlers extends StreamHandlers {
       message?: string
     }>,
   ) => void
+  onDocument?: (payload: {
+    html: string
+    generatedDocumentId: string
+    sources: ChatSourceRef[]
+    metadata: Record<string, unknown>
+  }) => void
 }
 
 export async function createBackgroundChatJob(
   question: string,
   opts: {
-    mode: 'chat' | 'agent'
+    mode: 'chat' | 'agent' | 'report'
     topK?: number
     finalK?: number
     documentId?: string | null
+    /** Attach this turn to an existing SQL-persisted conversation. */
+    conversationId?: string | null
   },
 ): Promise<BackgroundChatJob> {
-  const { data } = await api.post<{ job_id: string; status: 'queued' }>(
-    '/chat/jobs',
-    {
-      question,
-      mode: opts.mode,
-      top_k: opts.topK ?? 15,
-      final_k: opts.finalK ?? 5,
-      ...(opts.documentId ? { document_id: opts.documentId } : {}),
-    },
-  )
-  return { jobId: data.job_id, status: data.status }
+  const { data } = await api.post<{
+    job_id: string
+    status: 'queued'
+    conversation_id: string
+  }>('/chat/jobs', {
+    question,
+    mode: opts.mode,
+    top_k: opts.topK ?? 15,
+    final_k: opts.finalK ?? 5,
+    ...(opts.documentId ? { document_id: opts.documentId } : {}),
+    ...(opts.conversationId ? { conversation_id: opts.conversationId } : {}),
+  })
+  return {
+    jobId: data.job_id,
+    status: data.status,
+    conversationId: data.conversation_id,
+  }
+}
+
+export async function cancelBackgroundChatJob(jobId: string): Promise<void> {
+  await api.post(`/chat/jobs/${jobId}/cancel`)
+}
+
+/** Check a background job's current status (used to resume after a refresh). */
+export async function fetchBackgroundChatJobStatus(
+  jobId: string,
+): Promise<BackgroundChatJobStatus> {
+  const { data } = await api.get<{
+    job_id: string
+    mode: 'chat' | 'agent' | 'report'
+    status: 'queued' | 'processing' | 'completed' | 'failed' | 'cancelled'
+    event_count: number
+    created_at: string | null
+  }>(`/chat/jobs/${jobId}`)
+  return {
+    jobId: data.job_id,
+    mode: data.mode,
+    status: data.status,
+    eventCount: data.event_count,
+    createdAt: data.created_at ?? null,
+  }
 }
 
 /** Replay all stored fragments and keep following the Redis-backed job. */
 export async function streamBackgroundChatJob(
   jobId: string,
   handlers: BackgroundJobHandlers,
-  opts: { signal?: AbortSignal } = {},
+  opts: { signal?: AbortSignal; after?: number } = {},
 ): Promise<void> {
   const token = getToken()
+  let eventCount = opts.after ?? 0
   let response: Response
   try {
-    response = await fetch(`${API_BASE}/chat/jobs/${jobId}/stream`, {
+    response = await fetch(
+      `${API_BASE}/chat/jobs/${jobId}/stream?after=${eventCount}`,
+      {
       headers: {
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
       signal: opts.signal,
-    })
+      },
+    )
   } catch (err) {
+    // A deliberate abort (e.g. the user switched conversations) is a clean
+    // stop, not an error — the durable job keeps running in the background.
+    if (opts.signal?.aborted) return
     handlers.onError?.(err instanceof Error ? err.message : 'Erreur réseau')
     return
   }
@@ -198,7 +255,11 @@ export async function streamBackgroundChatJob(
         text?: string
         answer?: string
         metadata?: Record<string, unknown>
+        html?: string
+        generated_document_id?: string
       }
+      eventCount += 1
+      handlers.onEvent?.(eventCount)
       if (evt.type === 'agent')
         handlers.onAgent?.({
           mode: evt.mode ?? 'single',
@@ -208,25 +269,43 @@ export async function streamBackgroundChatJob(
       else if (evt.type === 'status') handlers.onStatus?.(evt.message ?? '')
       else if (evt.type === 'sources') handlers.onSources?.(evt.sources ?? [])
       else if (evt.type === 'analyses') handlers.onAnalyses?.(evt.analyses ?? [])
+      else if (evt.type === 'document')
+        handlers.onDocument?.({
+          html: evt.html ?? '',
+          generatedDocumentId: evt.generated_document_id ?? '',
+          sources: evt.sources ?? [],
+          metadata: evt.metadata ?? {},
+        })
       else if (evt.type === 'delta') handlers.onDelta?.(evt.text ?? '')
       else if (evt.type === 'done')
         handlers.onDone?.({ answer: evt.answer, metadata: evt.metadata ?? {} })
       else if (evt.type === 'error')
         handlers.onError?.(evt.message ?? 'Une erreur est survenue.')
+      else if (evt.type === 'cancelled')
+        handlers.onCancelled?.(
+          evt.message ?? 'Génération arrêtée à votre demande.',
+        )
     } catch {
       /* Ignore malformed/heartbeat fragments. */
     }
   }
 
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-    const chunks = buffer.split('\n\n')
-    buffer = chunks.pop() ?? ''
-    for (const chunk of chunks) handleEvent(chunk)
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const chunks = buffer.split('\n\n')
+      buffer = chunks.pop() ?? ''
+      for (const chunk of chunks) handleEvent(chunk)
+    }
+    if (buffer.trim()) handleEvent(buffer)
+  } catch (err) {
+    // Reading was aborted (conversation switch) — stop quietly; the background
+    // job continues and can be resumed later. Re-surface any other error.
+    if (opts.signal?.aborted) return
+    handlers.onError?.(err instanceof Error ? err.message : 'Erreur réseau')
   }
-  if (buffer.trim()) handleEvent(buffer)
 }
 
 /**

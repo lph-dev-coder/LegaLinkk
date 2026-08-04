@@ -59,6 +59,51 @@ class AgentQueryResponse(BaseModel):
     compliance: AgentAnswer | None = None
 
 
+class AgentSynthesisResult(BaseModel):
+    """Persisted multi-agent synthesis for one contract.
+
+    ``recommendation`` is the synthesis agent's cross-disciplinary conclusion;
+    ``legal`` / ``finance`` / ``compliance`` are the three individual analyses
+    it was built from (shown as collapsible detail on the Analysis page).
+    """
+
+    recommendation: str | None = None
+    legal: AgentAnswer | None = None
+    finance: AgentAnswer | None = None
+    compliance: AgentAnswer | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SynthesisJobRequest(BaseModel):
+    """Start a durable multi-agent synthesis for one owned contract."""
+
+    document_id: UUID
+    force_refresh: bool = Field(
+        default=False,
+        description="Ignore a stored synthesis and recompute a fresh one",
+    )
+    top_k: int | None = Field(default=None, ge=1, le=50)
+    final_k: int | None = Field(default=None, ge=1, le=50)
+    temperature: float | None = Field(default=None, ge=0.0, le=1.0)
+    max_tokens: int | None = Field(default=None, ge=64, le=8192)
+
+
+class SynthesisJobCreateResponse(BaseModel):
+    job_id: UUID
+    document_id: UUID
+    status: Literal["queued"]
+
+
+class SynthesisJobStatusResponse(BaseModel):
+    job_id: UUID
+    document_id: UUID
+    status: Literal["queued", "processing", "completed", "failed"]
+    progress: int = Field(ge=0, le=100)
+    message: str
+    result: AgentSynthesisResult | None = None
+    error: str | None = None
+
+
 class LegalAnalyzeRequest(BaseModel):
     """Request for a specialized legal contract analysis."""
 

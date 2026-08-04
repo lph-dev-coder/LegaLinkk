@@ -106,19 +106,21 @@ class AgentStreamService:
         match = _COMMAND_RE.match(raw)
         if match:
             domain = match.group(1).lower()
-            remainder = (
-                (match.group(2) or "").strip()
-                or _DEFAULT_QUESTIONS[domain]
-            )
+            remainder = (match.group(2) or "").strip()
+            # Bare "/finance" (no user text) → default question → full-document
+            # when a contract is scoped. An explicit follow-up stays Top-K.
+            is_default_question = not bool(remainder)
+            question = remainder or _DEFAULT_QUESTIONS[domain]
             async for event in self._stream_single(
                 domain,
-                remainder,
+                question,
                 user_id=user_id,
                 document_id=document_id,
                 top_k=top_k,
                 final_k=final_k,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                is_default_question=is_default_question,
             ):
                 yield event
             return
@@ -131,6 +133,8 @@ class AgentStreamService:
             final_k=final_k,
             temperature=temperature,
             max_tokens=max_tokens,
+            # Free-form multi /synthese text is treated as a targeted question.
+            is_default_question=False,
         ):
             yield event
 
@@ -145,9 +149,15 @@ class AgentStreamService:
         final_k: int | None,
         temperature: float | None,
         max_tokens: int | None,
+        is_default_question: bool = False,
     ) -> AsyncIterator[dict[str, Any]]:
         agent_name, system_prompt, _label = _DOMAINS[domain]
-        logger.info("[agent_stream] single domain=%s document_id=%s", domain, document_id)
+        logger.info(
+            "[agent_stream] single domain=%s document_id=%s is_default_question=%s",
+            domain,
+            document_id,
+            is_default_question,
+        )
         # Tell the UI which agent is answering before any content flows.
         yield {"type": "agent", "mode": "single", "domain": domain, "label": agent_name}
         assessment = self._domain_guard.assess(
@@ -182,6 +192,7 @@ class AgentStreamService:
             max_tokens=budget,
             document_id=document_id,
             system_prompt=system_prompt,
+            is_default_question=is_default_question,
         ):
             yield event
 
@@ -195,8 +206,13 @@ class AgentStreamService:
         final_k: int | None,
         temperature: float | None,
         max_tokens: int | None,
+        is_default_question: bool = False,
     ) -> AsyncIterator[dict[str, Any]]:
-        logger.info("[agent_stream] multi (synthesis) document_id=%s", document_id)
+        logger.info(
+            "[agent_stream] multi (synthesis) document_id=%s is_default_question=%s",
+            document_id,
+            is_default_question,
+        )
         yield {"type": "agent", "mode": "multi"}
         started = time.perf_counter()
         budget = max_tokens or self._settings.agent_max_tokens
@@ -216,6 +232,7 @@ class AgentStreamService:
                     max_tokens=budget,
                     document_id=document_id,
                     system_prompt=system_prompt,
+                    is_default_question=is_default_question,
                 )
                 answer = (rag.get("answer") or "").strip()
                 analyses_public.append(

@@ -54,6 +54,9 @@ class ChatJobStore:
         user_id: UUID,
         mode: str,
         task_id: str | None = None,
+        title: str | None = None,
+        document_id: UUID | None = None,
+        conversation_id: UUID | None = None,
     ) -> None:
         client = self._require_client()
         meta_key = self._meta_key(job_id)
@@ -62,6 +65,9 @@ class ChatJobStore:
             "job_id": job_id,
             "user_id": str(user_id),
             "mode": mode,
+            "title": (title or "").strip()[:255],
+            "document_id": str(document_id) if document_id else "",
+            "conversation_id": str(conversation_id) if conversation_id else "",
             "status": "queued",
             "task_id": task_id or "",
             "created_at": _now_iso(),
@@ -86,6 +92,16 @@ class ChatJobStore:
     async def append_event(self, job_id: str, event: dict[str, Any]) -> int:
         client = self._require_client()
         events_key = self._events_key(job_id)
+        if event.get("type") in {"done", "error"}:
+            status = await asyncio.to_thread(
+                client.hget,
+                self._meta_key(job_id),
+                "status",
+            )
+            if status == "cancelled":
+                return int(
+                    await asyncio.to_thread(client.llen, events_key) or 0
+                )
         encoded = json.dumps(event, default=str, ensure_ascii=False)
 
         def append() -> int:
@@ -100,6 +116,8 @@ class ChatJobStore:
             await self._update_meta(job_id, status="completed")
         elif event.get("type") == "error":
             await self._update_meta(job_id, status="failed")
+        elif event.get("type") == "cancelled":
+            await self._update_meta(job_id, status="cancelled")
         return length
 
     async def mark_failed(self, job_id: str, message: str) -> None:
@@ -110,6 +128,15 @@ class ChatJobStore:
                 "message": message,
                 "code": "background_generation_failed",
                 "retryable": True,
+            },
+        )
+
+    async def mark_cancelled(self, job_id: str) -> None:
+        await self.append_event(
+            job_id,
+            {
+                "type": "cancelled",
+                "message": "Génération arrêtée à votre demande.",
             },
         )
 

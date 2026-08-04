@@ -89,6 +89,7 @@ services:
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
       REDIS_URL: redis://redis:6379/0
+      BRAND_LOGO_PATH: /brand/logo.png
       EMBEDDING_CACHE_DIR: /root/.cache/fastembed
       OMP_NUM_THREADS: "1"
       MKL_NUM_THREADS: "1"
@@ -105,6 +106,7 @@ services:
         condition: service_healthy
     volumes:
       - ./backend:/app
+      - ./frontend/public/logo.png:/brand/logo.png:ro
       - embedding_cache:/root/.cache/fastembed
     # Single worker/concurrency=1 keeps memory bounded on low-RAM hosts.
     command: >

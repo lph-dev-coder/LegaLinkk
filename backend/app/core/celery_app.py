@@ -18,7 +18,13 @@ celery_app = Celery(
     "legallink",
     broker=settings.effective_celery_broker_url,
     backend=settings.effective_celery_result_backend,
-    include=["app.tasks.ingestion", "app.tasks.chat", "app.tasks.analysis"],
+    include=[
+        "app.tasks.ingestion",
+        "app.tasks.chat",
+        "app.tasks.analysis",
+        "app.tasks.synthesis",
+        "app.tasks.comparison",
+    ],
 )
 
 celery_app.conf.update(

@@ -5,16 +5,17 @@ import json
 import re
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import Response, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
-from app.core.exceptions import AppError
+from app.core.celery_app import celery_app
+from app.core.exceptions import AppError, NotFoundError
 from app.core.logging import get_logger
 from app.db.session import get_db
+from app.models.conversation import MessageRole
 from app.models.user import User
-from app.models.generated_document import GeneratedDocumentKind
 from app.graphs.rag_graph import build_rag_graph
 from app.schemas.chat import (
     ChatDocumentPdfRequest,
@@ -25,7 +26,7 @@ from app.schemas.chat import (
     ChatQueryRequest,
     ChatQueryResponse,
 )
-from app.services.pdf import brand_report_html, render_html_to_pdf
+from app.services.pdf import render_html_to_pdf
 from app.schemas.conversation import (
     ConversationCreateRequest,
     ConversationListResponse,
@@ -39,11 +40,24 @@ from app.services.chat_job import get_chat_job_store
 from app.services.generator import GeneratorService
 from app.services.generated_document import GeneratedDocumentService
 from app.services.langfuse_service import get_langfuse_service
+from app.services.report_generation import ReportGenerationService
 from app.tasks.chat import process_chat_job_task
 
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/chat", tags=["Chat"])
+
+
+def _derive_conversation_title(question: str) -> str:
+    """Human-friendly conversation title from the first message.
+
+    Drops a leading agent slash command (``/finance``, ``/synthese`` …) so the
+    sidebar shows the real request, and caps the length for the list.
+    """
+    text = re.sub(r"^\s*/[^\s]+\s*", "", question or "").strip() or (
+        question or ""
+    ).strip()
+    return f"{text[:60]}…" if len(text) > 60 else text
 
 
 def get_generator_service(db: AsyncSession = Depends(get_db)) -> GeneratorService:
@@ -239,16 +253,59 @@ async def chat_query(
 )
 async def create_chat_job(
     body: ChatJobCreateRequest,
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> ChatJobCreateResponse:
-    """Queue generation independently from the browser's HTTP connection."""
+    """Queue generation independently from the browser's HTTP connection.
+
+    Every turn is durably persisted in PostgreSQL (not just Redis): the user
+    message is stored immediately, and the assistant reply is stored by the
+    Celery task once generation completes. Redis remains the transport used
+    to stream/resume the live response; SQL is the source of truth for
+    conversation history across sessions and devices.
+    """
+    conversations = ConversationService(db)
+    derived_title = _derive_conversation_title(body.question)
+    if body.conversation_id is not None:
+        conversation_id = body.conversation_id
+        # The conversation was created (untitled) before the first turn — give
+        # it a human title so the history sidebar never shows a generic label.
+        await conversations.ensure_title(
+            conversation_id, user_id=current_user.id, title=derived_title
+        )
+    else:
+        conversation = await conversations.create_conversation(
+            user_id=current_user.id, title=derived_title or None
+        )
+        conversation_id = conversation.id
+
+    try:
+        await conversations.append_message(
+            conversation_id,
+            user_id=current_user.id,
+            role=MessageRole.USER,
+            content=body.question,
+        )
+    except NotFoundError:
+        raise
+    except Exception:
+        # Non-fatal: the live Redis-backed response still works even if the
+        # durable history write fails; log it for investigation.
+        logger.exception(
+            "Could not persist user message conversation_id=%s", conversation_id
+        )
+
     store = get_chat_job_store()
     job_id = uuid4()
-    payload = body.model_dump(mode="json", exclude={"mode"})
+    payload = body.model_dump(mode="json", exclude={"mode", "conversation_id"})
+    payload["conversation_id"] = str(conversation_id)
     await store.create(
         str(job_id),
         user_id=current_user.id,
         mode=body.mode,
+        title=body.question,
+        document_id=body.document_id,
+        conversation_id=conversation_id,
     )
     try:
         result = await asyncio.to_thread(
@@ -271,7 +328,9 @@ async def create_chat_job(
             code="chat_job_enqueue_failed",
             retryable=True,
         ) from exc
-    return ChatJobCreateResponse(job_id=job_id, status="queued")
+    return ChatJobCreateResponse(
+        job_id=job_id, status="queued", conversation_id=conversation_id
+    )
 
 
 @router.get(
@@ -285,6 +344,48 @@ async def get_chat_job(
 ) -> ChatJobStatusResponse:
     store = get_chat_job_store()
     meta = await store.get_meta_for_user(str(job_id), user_id=current_user.id)
+    _events, event_count = await store.get_events(str(job_id))
+    return ChatJobStatusResponse(
+        job_id=job_id,
+        mode=meta["mode"],
+        status=meta["status"],
+        event_count=event_count,
+        created_at=meta.get("created_at") or None,
+    )
+
+
+@router.post(
+    "/jobs/{job_id}/cancel",
+    response_model=ChatJobStatusResponse,
+    summary="Stop a running background chat generation",
+)
+async def cancel_chat_job(
+    job_id: UUID,
+    current_user: User = Depends(get_current_user),
+) -> ChatJobStatusResponse:
+    store = get_chat_job_store()
+    meta = await store.get_meta_for_user(str(job_id), user_id=current_user.id)
+    if meta["status"] not in {"completed", "failed", "cancelled"}:
+        task_id = meta.get("task_id")
+        if task_id:
+            try:
+                await asyncio.to_thread(
+                    celery_app.control.revoke,
+                    task_id,
+                    terminate=True,
+                    signal="SIGTERM",
+                )
+            except Exception as exc:
+                logger.exception("Could not cancel chat job job_id=%s", job_id)
+                raise AppError(
+                    "La génération n'a pas pu être arrêtée. Veuillez réessayer.",
+                    status_code=503,
+                    code="chat_job_cancel_failed",
+                    retryable=True,
+                ) from exc
+        await store.mark_cancelled(str(job_id))
+        meta["status"] = "cancelled"
+
     _events, event_count = await store.get_events(str(job_id))
     return ChatJobStatusResponse(
         job_id=job_id,
@@ -317,7 +418,7 @@ async def stream_chat_job(
                 str(job_id),
                 user_id=current_user.id,
             )
-            if meta["status"] in {"completed", "failed"} and not events:
+            if meta["status"] in {"completed", "failed", "cancelled"} and not events:
                 break
             if not events:
                 yield ": keepalive\n\n"
@@ -347,11 +448,10 @@ async def stream_chat_job(
 )
 async def chat_document(
     body: ChatQueryRequest,
-    generator: GeneratorService = Depends(get_generator_service),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> ChatDocumentResponse:
-    result = await generator.generate_document(
+    result = await ReportGenerationService(db).generate(
         body.question,
         user_id=current_user.id,
         top_k=body.top_k,
@@ -360,29 +460,15 @@ async def chat_document(
         max_tokens=body.max_tokens,
         document_id=body.document_id,
     )
-    result["html"] = brand_report_html(result["html"])
-    pdf_bytes = await asyncio.to_thread(render_html_to_pdf, result["html"])
-    title = f"Rapport — {body.question.strip()[:100]}"
-    source_ids = {
-        UUID(str(source["document_id"]))
-        for source in result.get("sources", [])
-        if source.get("document_id")
-    }
-    source_document_id = body.document_id or (
-        next(iter(source_ids)) if len(source_ids) == 1 else None
-    )
-    generated = await GeneratedDocumentService(db).save_pdf(
-        pdf_bytes,
-        user_id=current_user.id,
-        source_document_id=source_document_id,
-        title=title,
-        filename=f"{title}.pdf",
-        kind=GeneratedDocumentKind.CHAT_REPORT,
-        question=body.question,
-    )
-    return ChatDocumentResponse.model_validate(
-        {**result, "generated_document_id": generated.id}
-    )
+    if result.get("status") == "out_of_scope":
+        # A specialist slash command was used out of its domain: no PDF exists,
+        # so surface a clean, human-readable refusal instead of a 500.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=result.get("message")
+            or "Cette demande ne relève pas du domaine de l'assistant choisi.",
+        )
+    return ChatDocumentResponse.model_validate(result)
 
 
 def _safe_pdf_filename(name: str | None) -> str:

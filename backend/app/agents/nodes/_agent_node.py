@@ -90,8 +90,17 @@ class DomainAgentNode(BaseGraphAgent):
                 }
                 return state
 
-        logger.info("[multi_agent] node=%s analysing", self._node_name)
+        is_default_question = bool(metadata.get("is_default_question"))
+        logger.info(
+            "[multi_agent] node=%s analysing document_id=%s "
+            "is_default_question=%s",
+            self._node_name,
+            metadata.get("document_id"),
+            is_default_question,
+        )
         try:
+            # Retrieval mode (Top-K vs full-document) is decided once inside
+            # GeneratorService._resolve_answer_chunks — not duplicated here.
             rag: dict[str, Any] = await self._generator.answer_question(
                 question,
                 user_id=UUID(str(metadata["user_id"])),
@@ -102,6 +111,7 @@ class DomainAgentNode(BaseGraphAgent):
                 history=history,
                 document_id=metadata.get("document_id"),
                 system_prompt=self._system_prompt,
+                is_default_question=is_default_question,
             )
             state[self._result_key] = {
                 "agent": self._agent_name,
@@ -111,7 +121,15 @@ class DomainAgentNode(BaseGraphAgent):
                 "sources": list(rag.get("sources") or []),
                 "metadata": dict(rag.get("metadata") or {}),
             }
-            logger.info("[multi_agent] node=%s ok", self._node_name)
+            rag_meta = rag.get("metadata") or {}
+            logger.info(
+                "[multi_agent] node=%s ok retrieval_mode=%s "
+                "chunks_sent=%s chars_sent=%s",
+                self._node_name,
+                rag_meta.get("retrieval_mode"),
+                rag_meta.get("context_chunks"),
+                rag_meta.get("context_chars_sent"),
+            )
         except Exception as exc:  # graceful degradation: never break the graph
             logger.exception("[multi_agent] node=%s failed", self._node_name)
             message = (

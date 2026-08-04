@@ -2,21 +2,25 @@ import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
 import { RequireAuth } from '@/components/RequireAuth'
 import {
   AnalysisLayout,
+  ComparisonsLayout,
   ConsultationLayout,
   DashboardLayout,
   DocumentsLayout,
   GeneratedDocumentsLayout,
   HistoryLayout,
   SettingsLayout,
+  TasksLayout,
 } from '@/layouts/AppLayout'
 import { AnalysisPage } from '@/pages/Analysis'
 import { ConsultationPage } from '@/pages/Consultation'
+import { ComparisonsPage } from '@/pages/Comparisons'
 import { DashboardPage } from '@/pages/Dashboard'
 import { DocumentsPage } from '@/pages/Documents'
 import { GeneratedDocumentsPage } from '@/pages/GeneratedDocuments'
 import { HistoryPage } from '@/pages/History'
 import { LoginPage } from '@/pages/Login'
 import { SettingsPage } from '@/pages/Settings'
+import { TasksPage } from '@/pages/Tasks'
 
 export default function App() {
   return (
@@ -34,6 +38,10 @@ export default function App() {
             <Route path="/consultation" element={<ConsultationPage />} />
           </Route>
 
+          <Route element={<ComparisonsLayout />}>
+            <Route path="/comparisons" element={<ComparisonsPage />} />
+          </Route>
+
           <Route element={<DocumentsLayout />}>
             <Route path="/documents" element={<DocumentsPage />} />
           </Route>
@@ -43,6 +51,10 @@ export default function App() {
               path="/generated-documents"
               element={<GeneratedDocumentsPage />}
             />
+          </Route>
+
+          <Route element={<TasksLayout />}>
+            <Route path="/tasks" element={<TasksPage />} />
           </Route>
 
           <Route element={<AnalysisLayout />}>

@@ -180,6 +180,15 @@ export interface AgentQueryResult {
   compliance?: AgentAnswer | null
 }
 
+/** Persisted multi-agent synthesis for a contract (Analysis page Résumé tab). */
+export interface AgentSynthesisResult {
+  recommendation?: string | null
+  legal?: AgentAnswer | null
+  finance?: AgentAnswer | null
+  compliance?: AgentAnswer | null
+  metadata?: Record<string, unknown>
+}
+
 /** An individual agent analysis attached to a chat message (multi-agent mode). */
 export interface ChatAgentAnalysis {
   domain: string
@@ -205,11 +214,14 @@ export interface ChatMessage {
   agentAnalyses?: ChatAgentAnalysis[]
   /** Redis-backed generation that can be replayed after navigation/refresh. */
   backgroundJobId?: string
-  backgroundJobMode?: 'chat' | 'agent'
-  backgroundJobStatus?: 'processing' | 'completed' | 'failed'
+  backgroundJobMode?: 'chat' | 'agent' | 'report'
+  backgroundJobStatus?: 'processing' | 'completed' | 'failed' | 'cancelled'
+  backgroundJobEventCount?: number
   generatedReportSourceDocumentId?: string
   generatedReportQuestion?: string
   generatedDocumentId?: string
+  /** True while this reply is being resumed after a navigation/refresh. */
+  resumed?: boolean
 }
 
 export interface GeneratedDocumentItem {
@@ -222,6 +234,61 @@ export interface GeneratedDocumentItem {
   kind: 'chat_report' | 'analysis_export'
   question: string | null
   createdAt: string
+}
+
+export interface UserTask {
+  id: string
+  type:
+    | 'chat'
+    | 'agent'
+    | 'report'
+    | 'analysis'
+    | 'synthesis'
+    | 'comparison'
+    | 'ingestion'
+  title: string
+  status: 'queued' | 'processing' | 'completed' | 'failed' | 'cancelled'
+  progress: number
+  message: string
+  documentId: string | null
+  destination: string
+  createdAt: string
+  updatedAt: string
+  error: string | null
+}
+
+export type ComparisonChangeType =
+  | 'added'
+  | 'removed'
+  | 'modified'
+  | 'unchanged'
+
+export interface ClauseChange {
+  clause: string
+  change_type: ComparisonChangeType
+  base_text: string
+  target_text: string
+  risk_impact: RiskLevel
+  risk_reason: string
+  base_pages: number[]
+  target_pages: number[]
+}
+
+export interface ContractComparisonResult {
+  base_document_id: string
+  target_document_id: string
+  base_filename: string
+  target_filename: string
+  summary: string
+  overall_risk_impact: RiskLevel
+  added_count: number
+  removed_count: number
+  modified_count: number
+  unchanged_count: number
+  changes: ClauseChange[]
+  recommendations: string[]
+  metadata?: Record<string, unknown>
+  cached?: boolean
 }
 
 export interface CriticalPoint {

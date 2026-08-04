@@ -37,6 +37,29 @@ class ConversationService:
         logger.info("Conversation created id=%s", conversation.id)
         return conversation
 
+    async def ensure_title(
+        self, conversation_id: UUID, *, user_id: UUID, title: str
+    ) -> None:
+        """Set the title from the first turn when it is still empty.
+
+        Conversations are created lazily (untitled) before the first message is
+        sent, so the history sidebar would otherwise show a generic label. This
+        fills that label once, without overwriting a title already set.
+        """
+        cleaned = (title or "").strip()
+        if not cleaned:
+            return
+        conversation = await self._repo.get_by_id(
+            conversation_id, user_id=user_id
+        )
+        if conversation is None or (conversation.title or "").strip():
+            return
+        conversation.title = cleaned[:255]
+        await self._session.commit()
+        logger.info(
+            "Conversation titled id=%s title=%r", conversation_id, cleaned[:60]
+        )
+
     async def get_conversation(
         self,
         conversation_id: UUID,
