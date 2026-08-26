@@ -12,6 +12,7 @@ from app.api.v1.endpoints import (
     generated_documents,
     health,
     retrieval,
+    settings,
     tasks,
 )
 
@@ -30,3 +31,4 @@ api_router.include_router(chat.router, dependencies=_protected)
 api_router.include_router(comparisons.router, dependencies=_protected)
 api_router.include_router(agents.router, dependencies=_protected)
 api_router.include_router(tasks.router, dependencies=_protected)
+api_router.include_router(settings.router, dependencies=_protected)

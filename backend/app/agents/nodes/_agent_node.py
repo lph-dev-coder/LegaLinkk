@@ -14,6 +14,7 @@ from uuid import UUID
 
 from app.agents.base_agent import BaseGraphAgent
 from app.agents.nodes._state_utils import ensure_metadata
+from app.agents.prompt_catalog import effective_prompt
 from app.core.exceptions import AppError
 from app.core.logging import get_logger
 from app.services.domain_guard import DomainGuardService
@@ -110,7 +111,11 @@ class DomainAgentNode(BaseGraphAgent):
                 max_tokens=metadata.get("max_tokens") or self._default_max_tokens,
                 history=history,
                 document_id=metadata.get("document_id"),
-                system_prompt=self._system_prompt,
+                system_prompt=effective_prompt(
+                    metadata.get("agent_prompts"),
+                    self._domain,  # type: ignore[arg-type]
+                    fallback=self._system_prompt,
+                ),
                 is_default_question=is_default_question,
             )
             state[self._result_key] = {

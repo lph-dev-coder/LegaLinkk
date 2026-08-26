@@ -31,6 +31,7 @@ from app.schemas.agents import (
     SynthesisJobRequest,
     SynthesisJobStatusResponse,
 )
+from app.services.agent_prompt import AgentPromptService
 from app.services.agent_stream import AgentStreamService
 from app.services.analysis_job import (
     get_analysis_job_store,
@@ -98,6 +99,7 @@ async def agents_query(
     graph = build_multi_agent_graph(
         session=db, settings=settings, langfuse=langfuse, trace=trace
     )
+    prompts = await AgentPromptService(db).resolve(current_user.id)
     initial: GraphState = {
         "user_query": body.question,
         "metadata": {
@@ -107,6 +109,7 @@ async def agents_query(
             "temperature": body.temperature,
             "max_tokens": body.max_tokens,
             "document_id": body.document_id,
+            "agent_prompts": prompts,
         },
         "errors": [],
     }
@@ -151,10 +154,13 @@ async def agents_query(
 )
 async def agents_stream(
     body: AgentQueryRequest,
+    db: AsyncSession = Depends(get_db),
     generator: GeneratorService = Depends(get_generator_service),
     current_user: User = Depends(get_current_user),
 ) -> StreamingResponse:
-    service = AgentStreamService(generator)
+    service = AgentStreamService(
+        generator, prompt_service=AgentPromptService(db)
+    )
 
     async def event_source():
         try:

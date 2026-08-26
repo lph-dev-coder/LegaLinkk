@@ -1,4 +1,5 @@
 import type { ContractComparisonResult } from '@/types'
+import { isNotFound } from '@/lib/apiError'
 import { api } from './api'
 
 export interface ComparisonJobStatus {
@@ -25,14 +26,7 @@ export async function fetchCachedComparison(
     })
     return data
   } catch (error) {
-    if (
-      typeof error === 'object' &&
-      error !== null &&
-      'response' in error &&
-      (error as { response?: { status?: number } }).response?.status === 404
-    ) {
-      return null
-    }
+    if (isNotFound(error)) return null
     throw error
   }
 }

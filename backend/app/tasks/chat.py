@@ -11,6 +11,7 @@ from app.core.celery_app import celery_app
 from app.core.logging import get_logger
 from app.db.session import task_session
 from app.models.conversation import MessageRole
+from app.services.agent_prompt import AgentPromptService
 from app.services.agent_stream import AgentStreamService
 from app.services.chat_job import get_chat_job_store
 from app.services.conversation import ConversationService
@@ -144,7 +145,10 @@ async def _generate(
 
         generator = GeneratorService(session)
         if mode == "agent":
-            events = AgentStreamService(generator).stream(
+            events = AgentStreamService(
+                generator,
+                prompt_service=AgentPromptService(session),
+            ).stream(
                 str(payload["question"]),
                 user_id=owner_id,
                 document_id=document_id,

@@ -81,5 +81,10 @@ export function HistoryLayout() {
 }
 
 export function SettingsLayout() {
-  return <AppShell title="Paramètres" subtitle="Votre compte" />
+  return (
+    <AppShell
+      title="Paramètres"
+      subtitle="Compte et consignes des agents"
+    />
+  )
 }

@@ -7,20 +7,12 @@ import {
   fetchSynthesisJob,
   startSynthesisJob,
 } from '@/services/synthesis'
+import { isNotFound } from '@/lib/apiError'
 
 const SYNTHESIS_JOB_PREFIX = 'legallink.synthesis-job.v1'
 
 function jobKey(userId: string, documentId: string) {
   return `${SYNTHESIS_JOB_PREFIX}.${userId}.${documentId}`
-}
-
-function isNotFound(error: unknown) {
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    'response' in error &&
-    (error as { response?: { status?: number } }).response?.status === 404
-  )
 }
 
 async function pause(ms: number) {

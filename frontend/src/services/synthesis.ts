@@ -1,4 +1,5 @@
 import type { AgentSynthesisResult } from '@/types'
+import { isNotFound } from '@/lib/apiError'
 import { api } from './api'
 
 export interface SynthesisJobStatus {
@@ -24,14 +25,7 @@ export async function fetchCachedSynthesis(
     )
     return data
   } catch (error) {
-    if (
-      typeof error === 'object' &&
-      error !== null &&
-      'response' in error &&
-      (error as { response?: { status?: number } }).response?.status === 404
-    ) {
-      return null
-    }
+    if (isNotFound(error)) return null
     throw error
   }
 }

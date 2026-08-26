@@ -6,6 +6,7 @@ import {
   fetchComparisonJob,
   startComparisonJob,
 } from '@/services/comparisons'
+import { isNotFound } from '@/lib/apiError'
 import type { ContractComparisonResult } from '@/types'
 
 const PREFIX = 'legallink.comparison-job.v1'
@@ -75,6 +76,7 @@ export function useContractComparison(baseId?: string, targetId?: string) {
         setResult(result)
       } catch (cause) {
         localStorage.removeItem(storageKey)
+        if (isNotFound(cause)) throw cause
         setError(
           cause instanceof Error
             ? cause.message
@@ -101,8 +103,12 @@ export function useContractComparison(baseId?: string, targetId?: string) {
         if (!forceRefresh) {
           const existing = localStorage.getItem(storageKey)
           if (existing) {
-            await drive(existing, storageKey)
-            return
+            try {
+              await drive(existing, storageKey)
+              return
+            } catch (cause) {
+              if (!isNotFound(cause)) throw cause
+            }
           }
         }
         const job = await startComparisonJob({
@@ -127,10 +133,31 @@ export function useContractComparison(baseId?: string, targetId?: string) {
 
   useEffect(() => {
     if (!valid || !user?.id || !baseId || !targetId || running.current) return
-    const existing = localStorage.getItem(key(user.id, baseId, targetId))
+    const storageKey = key(user.id, baseId, targetId)
+    const existing = localStorage.getItem(storageKey)
     if (!existing) return
     running.current = true
-    void drive(existing, key(user.id, baseId, targetId))
+    void (async () => {
+      try {
+        await drive(existing, storageKey)
+      } catch (cause) {
+        if (!isNotFound(cause)) return
+        try {
+          const job = await startComparisonJob({
+            baseDocumentId: baseId,
+            targetDocumentId: targetId,
+          })
+          localStorage.setItem(storageKey, job.job_id)
+          await drive(job.job_id, storageKey)
+        } catch (startError) {
+          setError(
+            startError instanceof Error
+              ? startError.message
+              : 'La comparaison n’a pas pu être démarrée.',
+          )
+        }
+      }
+    })()
   }, [valid, user?.id, baseId, targetId, drive])
 
   return {

@@ -30,7 +30,13 @@ class DomainAssessment:
 
 
 class DomainGuardService:
-    """Prevent a selected specialist from answering outside its mandate."""
+    """Prevent a selected specialist from answering outside its mandate.
+
+    A selected agent may answer only when its domain is at least as strong as
+    every other domain (keyword-hit majority, ties keep the selected agent).
+    Foreign-dominated or out-of-scope questions are refused immediately — no
+    retrieval, no LLM.
+    """
 
     def __init__(self, router: IntentRouter | None = None) -> None:
         self._router = router or IntentRouter()
@@ -38,7 +44,15 @@ class DomainGuardService:
     def assess(self, query: str, *, target_domain: str) -> DomainAssessment:
         match = self._router.detect(query)
         detected = match.domains
-        if target_domain in detected:
+        scores = match.domain_scores
+        target_hits = scores.get(target_domain, 0)
+        other_max = max(
+            (score for domain, score in scores.items() if domain != target_domain),
+            default=0,
+        )
+
+        # Target must not be dominated by another specialty.
+        if target_hits > 0 and target_hits >= other_max:
             return DomainAssessment(
                 allowed=True,
                 target_domain=target_domain,
@@ -48,13 +62,25 @@ class DomainGuardService:
 
         target_label = _LABELS.get(target_domain, target_domain)
         if detected:
-            suggested = detected[0]
-            suggested_label = _LABELS.get(suggested, suggested)
-            message = (
-                f"Cette question ne relève pas du domaine {target_label}. "
-                f"Elle semble relever du domaine {suggested_label}. "
-                f"Utilisez la commande {_COMMANDS.get(suggested, f'/{suggested}')}."
+            # Prefer the strongest foreign domain for the redirect hint.
+            suggested = next(
+                (domain for domain in detected if domain != target_domain),
+                detected[0],
             )
+            suggested_label = _LABELS.get(suggested, suggested)
+            if target_hits > 0 and other_max > target_hits:
+                message = (
+                    f"Cette question dépasse le domaine {target_label} "
+                    f"(elle touche surtout le domaine {suggested_label}). "
+                    f"Utilisez {_COMMANDS.get(suggested, f'/{suggested}')} "
+                    "ou retirez le préfixe d’agent pour une analyse croisée."
+                )
+            else:
+                message = (
+                    f"Cette question ne relève pas du domaine {target_label}. "
+                    f"Elle semble relever du domaine {suggested_label}. "
+                    f"Utilisez la commande {_COMMANDS.get(suggested, f'/{suggested}')}."
+                )
         else:
             message = (
                 f"Cette question ne relève pas clairement du domaine {target_label}. "

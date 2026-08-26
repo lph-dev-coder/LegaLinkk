@@ -1,4 +1,5 @@
 import axios from 'axios'
+import { ApiError } from '@/lib/apiError'
 
 /**
  * Shared Axios client pointed at the backend API.
@@ -50,6 +51,11 @@ api.interceptors.response.use(
       error.response?.data?.detail ??
       error.message ??
       'Une erreur réseau est survenue'
-    return Promise.reject(new Error(typeof message === 'string' ? message : 'Erreur API'))
+    return Promise.reject(
+      new ApiError(
+        typeof message === 'string' ? message : 'Erreur API',
+        typeof status === 'number' ? status : undefined,
+      ),
+    )
   },
 )

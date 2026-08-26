@@ -12,21 +12,13 @@ import {
   fetchRecentActivity,
   uploadDocument,
 } from '@/services/documents'
+import { isNotFound } from '@/lib/apiError'
 
 const LEGAL_ANALYSIS_CACHE_VERSION = 4
 const ANALYSIS_JOB_PREFIX = 'legallink.analysis-job.v1'
 
 function analysisJobKey(userId: string, documentId: string) {
   return `${ANALYSIS_JOB_PREFIX}.${userId}.${documentId}`
-}
-
-function isNotFound(error: unknown) {
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    'response' in error &&
-    (error as { response?: { status?: number } }).response?.status === 404
-  )
 }
 
 async function pause(ms: number, signal?: AbortSignal) {

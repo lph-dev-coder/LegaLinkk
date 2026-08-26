@@ -8,7 +8,7 @@
 > services, endpoints, graphs/nodes, agents, frontend routes/pages, infra services, or data
 > flows). See `.cursor/rules/keep-architecture-doc-updated.mdc`.
 >
-> _Last verified: 2026-07-29 (contract comparison is now a persisted, Redis-resumable LangGraph workflow using full-document retrieval for both versions and a clause-by-clause risk-impact table)._
+> _Last verified: 2026-08-26 (per-user specialist agent system prompts are editable in Settings; hardcoded strings remain the defaults)._
 
 ---
 
@@ -247,13 +247,14 @@ All SQL lives in `repositories/`:
 | `DocumentAnalysisRepository` | persisted analyses | Get-or-compute persistence plus owner-scoped batch payload lookup for document scores |
 | `ContractComparisonRepository` | persisted contract comparisons | Latest comparison for an ordered `(base_document_id, target_document_id)` pair |
 | `UserRepository` | users | `create`, `get_by_email`, `get_by_id` |
+| `AgentPromptRepository` | user_agent_prompts | Latest per-user overrides of the four specialist system prompts |
 | `VectorRepository` | (helper) | vector-related helpers |
 
 ### Services / Routers / Models / Schemas / Config / Middleware / Utilities
 - **Services** (`app/services/`): `DocumentService`, `DocumentProcessingService`,
   `IndexingService`, `EmbeddingService`, `RetrievalService`, `RerankerService`,
   `GeneratorService`, deterministic `calculate_risk_score`, `ConversationService`, `AuthService`,
-  `IngestionProgressService`, `ContractComparisonService`,
+  `IngestionProgressService`, `ContractComparisonService`, `AgentPromptService`,
   `LangfuseService`, plus helpers (`chunker`, `text_cleaner`, `prompt_builder`,
   `context_formatter`) and `llm/` provider abstraction.
 - **Routers** (`app/api/v1/endpoints/`): thin — parse request, call one service, return a schema.
@@ -273,7 +274,7 @@ All SQL lives in `repositories/`:
 ## 4. Database
 
 PostgreSQL 16 with the **`vector`** extension. Schema is managed by Alembic
-(`versions/001`→`009`). Async access via `asyncpg`; Alembic uses sync `psycopg2`.
+(`versions/001`→`013`). Async access via `asyncpg`; Alembic uses sync `psycopg2`.
 
 ### Tables
 
@@ -287,6 +288,11 @@ PostgreSQL 16 with the **`vector`** extension. Schema is managed by Alembic
 | role | VARCHAR(50) | default `Juriste` |
 | is_active | BOOLEAN | default `true` |
 | created_at / updated_at | TIMESTAMPTZ | server default `now()` |
+
+**`user_agent_prompts`** (013) — optional per-account overrides of the four specialist
+system prompts (`legal`, `finance`, `compliance`, `synthesis`). Missing row or `NULL`
+column → hardcoded default from `agents/prompt_catalog.py` (`LEGAL_SYSTEM_PROMPT` and
+`agent_prompts.py`). Saving a prompt identical to the default stores `NULL` (not customized).
 
 **`documents`** (001, extended by 002/003/005/009) — owner-bound uploaded PDF metadata + lifecycle.
 | Column | Type | Notes |
@@ -628,9 +634,9 @@ JSON equivalent. Plain messages (no slash) still use `/chat/stream`.
 | **Conversation memory** | `ConversationService` — persists messages; `load_history` (limit `CONVERSATION_HISTORY_LIMIT=10`) injected into prompt (history loaded *before* current turn) | Feeds `GeneratorService.answer_question(history=...)` |
 | **Multi-Agent graph** | `build_multi_agent_graph` (LangGraph `StateGraph`) — `CommandParserNode` routes a `/legal\|/finance\|/compliance` command to a single agent node, else chains `LegalNode → FinanceNode → ComplianceNode → SynthesisNode`. Real graph nodes + conditional edges (no external Python dispatch) | Blocking `POST /agents/query` |
 | **Multi-Agent streaming** | `AgentStreamService` (`services/agent_stream.py`) — SSE counterpart used by the Consultation slash commands. A selected agent first passes `DomainGuardService`; out-of-scope requests stream a refusal without retrieval/LLM. Accepted single agents reuse `stream_answer`; `/synthese` runs three `answer_question` calls then a streamed synthesis. Every accepted specialist/synthesis uses `AGENT_MAX_TOKENS` (8192 by default), independently of the shorter chat budget. **Retrieval:** bare `/legal\|/finance\|/compliance` (no user text) with a scoped `document_id` uses full-document retrieval (`get_document_chunks`); an explicit follow-up question keeps Top-K. Decision is centralized in `GeneratorService._resolve_answer_chunks` via `is_default_question` (not duplicated in the stream service). | `POST /agents/stream` — Consultation **slash commands** (fragmented) |
-| **Legal/Finance/Compliance nodes** | `LegalNode`/`FinanceNode`/`ComplianceNode` (`agents/nodes/`, share `DomainAgentNode`) — each enforces the selected-agent domain boundary, then reuses the injected `GeneratorService` RAG pipeline with its specialized system prompt; writes `{legal,finance,compliance}_result` on the state. `CommandParserNode` sets `metadata.is_default_question`; the node passes that flag through so bare commands use full-document retrieval when a contract is scoped | Multi-agent graph nodes |
-| **Domain guard** | `DomainGuardService` wraps the multilingual deterministic detector in `agents/intent.py`; returns detected domains/keywords and a safe business message. It classifies scope only and does not perform graph routing. | Blocking graph nodes + streaming single-agent path |
-| **SynthesisNode** | `agents/nodes/synthesis_node.py` — reads the three result fields and calls the LLM provider with `SYNTHESIS_SYSTEM_PROMPT` to weigh/cross-reference them into `final_recommendation` (no retrieval, no new facts). Uses a large completion budget (`synthesis_max_tokens`, default 12000) and, if the model still stops on `length`, performs up to `synthesis_max_continuations` (default 2) continuation rounds so the cross-disciplinary recommendation is never cut off mid-section; flags `truncated` in metadata as a last resort | Multi-agent graph fan-in |
+| **Legal/Finance/Compliance nodes** | `LegalNode`/`FinanceNode`/`ComplianceNode` (`agents/nodes/`, share `DomainAgentNode`) — each enforces the selected-agent domain boundary, then reuses the injected `GeneratorService` RAG pipeline with its specialized system prompt (`metadata.agent_prompts` override or hardcoded default from `prompt_catalog`); writes `{legal,finance,compliance}_result` on the state. `CommandParserNode` sets `metadata.is_default_question`; the node passes that flag through so bare commands use full-document retrieval when a contract is scoped | Multi-agent graph nodes |
+| **Domain guard** | `DomainGuardService` wraps the multilingual keyword detector in `agents/intent.py`. A selected specialist answers only when its domain has at least as many keyword hits as every other domain; otherwise it refuses immediately (no retrieval/LLM) and suggests the right `/command`. | Blocking graph nodes + streaming single-agent path + PDF reports |
+| **SynthesisNode** | `agents/nodes/synthesis_node.py` — reads the three result fields and calls the LLM provider with the synthesis system prompt (`metadata.agent_prompts.synthesis` or `SYNTHESIS_SYSTEM_PROMPT`) to weigh/cross-reference them into `final_recommendation` (no retrieval, no new facts). Uses a large completion budget (`synthesis_max_tokens`, default 12000) and, if the model still stops on `length`, performs up to `synthesis_max_continuations` (default 2) continuation rounds so the cross-disciplinary recommendation is never cut off mid-section; flags `truncated` in metadata as a last resort | Multi-agent graph fan-in |
 | **Contract comparison graph** | `build_comparison_graph` (`graphs/comparison_graph.py`) contains a true `ComparisonNode`. The node is a thin wrapper over `ContractComparisonService`, which owner-checks both documents, loads all ordered chunks with `get_document_chunks`, allocates half of `COMPARISON_CONTEXT_CHARS` to each version, and produces structured clause-level additions/removals/modifications/unchanged rows with risk impact. Results persist in `contract_comparisons`; Celery/Redis make execution resumable | `/comparisons`, `comparison.generate` |
 | **LegalAgent** | `LegalAgent.analyze` — `GeneratorService.analyze_contract` (structured JSON: summary/risk/critical points/missing info/recommendations, full-document grounded) with `RuleBasedRiskClassifier` fallback. `calculate_risk_score` deterministically converts all deduplicated findings into a cumulative 0–100 score. `ContractAnalysisService` wraps it with get-or-compute persistence in `document_analyses`; cache identity uses document + analysis version + request fingerprint | `POST /agents/legal/analyze` (used by Analysis page) |
 
@@ -735,6 +741,12 @@ foreign UUID returns `404`.
 | POST `/agents/synthesis/jobs` | `SynthesisJobRequest` (owned `document_id` required) | `202 {job_id,document_id,status:"queued"}` | Redis synthesis `AnalysisJobStore` → Celery `synthesis.generate` | Redis + background DB/LLM work |
 | GET `/agents/synthesis/jobs/{job_id}` | — | owner-scoped `{status,progress,message,result?,error?}` | synthesis `AnalysisJobStore.get_for_user` | Redis |
 
+### Settings (protected)
+| Method / URL | Request | Response | Service | DB |
+|---|---|---|---|---|
+| GET `/settings/prompts` | — | current + default text for legal/finance/compliance/synthesis | `AgentPromptService.get_bundle` | SELECT `user_agent_prompts` (defaults if none) |
+| PUT `/settings/prompts` | optional `{legal,finance,compliance,synthesis}` | same bundle | `AgentPromptService.update` — empty/default text clears the override; formatted prompts must still accept `{no_answer}` | UPSERT `user_agent_prompts` |
+
 ### Contract comparisons (protected)
 | Method / URL | Request | Response | Service | DB |
 |---|---|---|---|---|
@@ -820,6 +832,11 @@ professional, non-technical payload and **never** a stack trace or internal deta
   `<RequireAuth>`: `/dashboard`, `/consultation`, `/documents`, `/analysis/:id`, `/history`,
   `/settings`; catch-all → `/dashboard`. ✗ `Supervision.tsx` and `AgentDetail.tsx` **exist but
   are not imported/routed** (dead pages).
+- **Settings (`/settings`):** profile (read-only) plus an editor for the four specialist
+  system prompts. `GET/PUT /settings/prompts` loads and saves per-user overrides; empty or
+  default-identical text restores the hardcoded prompt. Changes apply to `/legal`, `/finance`,
+  `/compliance` and synthesis on the next job (chat stream, blocking query, and Analysis-page
+  multi-agent synthesis).
 - **Auth (`context/AuthContext.tsx`, `RequireAuth`):** token in `localStorage`
   (`legallink_token`); on mount, hydrates via `GET /auth/me`; `login/register/logout`;
   `RequireAuth` shows a spinner during hydration then redirects unauthenticated users to `/login`.
@@ -827,12 +844,14 @@ professional, non-technical payload and **never** a stack trace or internal deta
   preventing stale server data from the previous account from flashing in the UI.
 - **API client (`services/api.ts`):** axios `baseURL = VITE_API_BASE_URL ?? '/api/v1'`, timeout
   **600s**; request interceptor injects Bearer token; response interceptor on **401** clears token
-  and hard-redirects to `/login` (except `/auth/*`).
+  and hard-redirects to `/login` (except `/auth/*`). Failed responses become `ApiError` with the
+  HTTP `status` preserved so durable-job hooks can detect expired Redis jobs (`404`) and start a
+  fresh job that reloads the Postgres-cached analysis/synthesis/comparison.
 - **Services:** `auth.ts` (`/auth/*`), `documents.ts` (`/documents*`), `chat.ts` (`askQuestion`
   ⚠ unused, `streamQuestion` SSE via `fetch`), `analysis.ts` (`/agents/legal/analyze`, including
   explicit `force_refresh`), `synthesis.ts` (`/agents/synthesis*` — cached peek + durable job
   start/poll), `comparisons.ts` (`/comparisons*` — cached peek + durable job start/poll),
-  `agents.ts` (`/agents/query`, `/agents/stream`).
+  `agents.ts` (`/agents/query`, `/agents/stream`), `settings.ts` (`/settings/prompts`).
 - **Hooks (`useDocuments.ts`):** `useDocuments`, `useRecentActivity`, `useLegalAnalysis(id)`
   (backend-persisted get-or-compute result), `useRefreshLegalAnalysis(id)` (explicit recompute),
   `useUploadDocument`, `useDocumentProgress(id)` (polls every 1.5s until terminal). The legal

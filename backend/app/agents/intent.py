@@ -12,6 +12,8 @@ class IntentMatch:
 
     domains: tuple[str, ...]
     keywords_hit: tuple[str, ...]
+    #: Number of keyword hits per domain (only domains with hits > 0).
+    domain_scores: dict[str, int]
 
 
 # Domain → trigger keywords (matched as whole words / phrases, case-insensitive).
@@ -39,11 +41,21 @@ DOMAIN_KEYWORDS: dict[str, tuple[str, ...]] = {
         "contrats",
         "juridique",
         "juridiques",
+        "juridiquement",
         "loi",
         "droit",
         "droits",
+        "légal",
+        "légale",
+        "legale",
+        "légaux",
+        "legaux",
         "résiliation",
         "resiliation",
+        "résilier",
+        "resilier",
+        "préavis",
+        "preavis",
         "responsabilité",
         "responsabilite",
         "validité",
@@ -57,8 +69,21 @@ DOMAIN_KEYWORDS: dict[str, tuple[str, ...]] = {
         "juridiction",
         "tribunal",
         "litige",
+        "litiges",
+        "contentieux",
+        "avocat",
+        "avenant",
+        "signataire",
+        "cession",
+        "article",
+        "articles",
+        "unilatéral",
+        "unilateral",
+        "unilatéralement",
+        "unilateralement",
         "indemnisation",
         "garantie",
+        "garanties",
         "force majeure",
         "propriété intellectuelle",
         "propriete intellectuelle",
@@ -125,6 +150,10 @@ DOMAIN_KEYWORDS: dict[str, tuple[str, ...]] = {
         "indexation",
         "révision des prix",
         "revision des prix",
+        "plafond",
+        "plafonds",
+        "cap",
+        "liability cap",
     ),
     "compliance": (
         "gdpr",
@@ -179,18 +208,29 @@ class IntentRouter:
     def detect(self, query: str) -> IntentMatch:
         text = (query or "").strip().lower()
         if not text:
-            return IntentMatch(domains=(), keywords_hit=())
+            return IntentMatch(domains=(), keywords_hit=(), domain_scores={})
 
-        domains: list[str] = []
+        scores: dict[str, int] = {}
         hits: list[str] = []
 
         for domain, keywords in DOMAIN_KEYWORDS.items():
             matched = [kw for kw in keywords if self._contains(text, kw)]
             if matched:
-                domains.append(domain)
+                scores[domain] = len(matched)
                 hits.extend(matched)
 
-        return IntentMatch(domains=tuple(domains), keywords_hit=tuple(hits))
+        # Stable order: highest score first, then name for ties.
+        ordered = tuple(
+            domain
+            for domain, _ in sorted(
+                scores.items(), key=lambda item: (-item[1], item[0])
+            )
+        )
+        return IntentMatch(
+            domains=ordered,
+            keywords_hit=tuple(hits),
+            domain_scores=scores,
+        )
 
     def agent_names_for(self, query: str) -> list[str]:
         """Map detected domains to agent class names."""

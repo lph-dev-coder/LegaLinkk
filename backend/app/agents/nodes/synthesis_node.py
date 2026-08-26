@@ -14,6 +14,7 @@ from typing import Any
 from app.agents.base_agent import BaseGraphAgent
 from app.agents.nodes._state_utils import ensure_metadata
 from app.agents.nodes.agent_prompts import SYNTHESIS_SYSTEM_PROMPT
+from app.agents.prompt_catalog import effective_prompt
 from app.core.config import Settings, get_settings
 from app.core.exceptions import AppError
 from app.core.logging import get_logger
@@ -91,8 +92,14 @@ class SynthesisNode(BaseGraphAgent):
             + "\n\n".join(sections)
             + missing_note
         )
+        metadata = ensure_metadata(state)
+        system_prompt = effective_prompt(
+            metadata.get("agent_prompts"),
+            "synthesis",
+            fallback=SYNTHESIS_SYSTEM_PROMPT,
+        )
         messages = [
-            {"role": "system", "content": SYNTHESIS_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
 

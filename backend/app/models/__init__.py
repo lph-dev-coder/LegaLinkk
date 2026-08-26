@@ -4,6 +4,7 @@ Import all models here so Alembic can discover them via ``Base.metadata``.
 """
 
 from app.db.base import Base
+from app.models.agent_prompt import UserAgentPrompts
 from app.models.analysis import ANALYSIS_VERSION, AnalysisStatus, DocumentAnalysis
 from app.models.chunk import DocumentChunk
 from app.models.comparison import COMPARISON_VERSION, ContractComparison
@@ -36,4 +37,5 @@ __all__ = [
     "Message",
     "MessageRole",
     "User",
+    "UserAgentPrompts",
 ]

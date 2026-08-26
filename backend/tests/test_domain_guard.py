@@ -14,7 +14,18 @@ def test_finance_agent_rejects_legal_question() -> None:
         target_domain="finance",
     )
     assert result.allowed is False
-    assert result.detected_domains == ("legal",)
+    assert result.detected_domains[0] == "legal"
+    assert "/legal" in (result.message or "")
+
+
+def test_finance_agent_rejects_legal_dominated_mixed_question() -> None:
+    """A mostly-legal ask must not slip through because one finance word appears."""
+    result = DomainGuardService().assess(
+        "Cette clause de nullité et de responsabilité est-elle valable devant le tribunal, et quel est le montant ?",
+        target_domain="finance",
+    )
+    assert result.allowed is False
+    assert "legal" in result.detected_domains
     assert "/legal" in (result.message or "")
 
 

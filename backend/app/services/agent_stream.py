@@ -23,21 +23,19 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
-from app.agents.legal import LEGAL_SYSTEM_PROMPT
-from app.agents.nodes.agent_prompts import (
-    COMPLIANCE_SYSTEM_PROMPT,
-    FINANCE_SYSTEM_PROMPT,
-    SYNTHESIS_SYSTEM_PROMPT,
-)
+from app.agents.prompt_catalog import default_agent_prompts
 from app.core.config import Settings, get_settings
 from app.core.exceptions import AppError
 from app.core.logging import get_logger
 from app.services.domain_guard import DomainGuardService
 from app.services.generator import GeneratorService
 from app.services.llm import LLMProvider, get_llm_provider
+
+if TYPE_CHECKING:
+    from app.services.agent_prompt import AgentPromptService
 
 logger = get_logger(__name__)
 
@@ -52,17 +50,12 @@ _DEFAULT_QUESTIONS = {
     "compliance": "Analyse la conformité réglementaire et RGPD de ce contrat.",
 }
 
-# domain -> (public agent name, specialized system prompt, human label)
-_DOMAINS: dict[str, tuple[str, str, str]] = {
-    "legal": ("LegalAgent", LEGAL_SYSTEM_PROMPT, "Analyse juridique (Legal)"),
-    "finance": (
-        "FinanceAgent",
-        FINANCE_SYSTEM_PROMPT,
-        "Analyse financière (Finance)",
-    ),
+# domain -> (public agent name, human label)
+_DOMAINS: dict[str, tuple[str, str]] = {
+    "legal": ("LegalAgent", "Analyse juridique (Legal)"),
+    "finance": ("FinanceAgent", "Analyse financière (Finance)"),
     "compliance": (
         "ComplianceAgent",
-        COMPLIANCE_SYSTEM_PROMPT,
         "Analyse conformité (Compliance)",
     ),
 }
@@ -79,11 +72,13 @@ class AgentStreamService:
         settings: Settings | None = None,
         llm_provider: LLMProvider | None = None,
         domain_guard: DomainGuardService | None = None,
+        prompt_service: "AgentPromptService | None" = None,
     ) -> None:
         self._generator = generator
         self._settings = settings or get_settings()
         self._llm = llm_provider
         self._domain_guard = domain_guard or DomainGuardService()
+        self._prompt_service = prompt_service
 
     def _get_llm(self) -> LLMProvider:
         if self._llm is None:
@@ -103,6 +98,7 @@ class AgentStreamService:
     ) -> AsyncIterator[dict[str, Any]]:
         """Route by leading ``/command`` and yield SSE event dicts."""
         raw = (question or "").strip()
+        prompts = await self._resolve_prompts(user_id)
         match = _COMMAND_RE.match(raw)
         if match:
             domain = match.group(1).lower()
@@ -121,6 +117,7 @@ class AgentStreamService:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 is_default_question=is_default_question,
+                prompts=prompts,
             ):
                 yield event
             return
@@ -135,8 +132,14 @@ class AgentStreamService:
             max_tokens=max_tokens,
             # Free-form multi /synthese text is treated as a targeted question.
             is_default_question=False,
+            prompts=prompts,
         ):
             yield event
+
+    async def _resolve_prompts(self, user_id: UUID) -> dict[str, str]:
+        if self._prompt_service is None:
+            return dict(default_agent_prompts())
+        return await self._prompt_service.resolve(user_id)
 
     async def _stream_single(
         self,
@@ -150,8 +153,10 @@ class AgentStreamService:
         temperature: float | None,
         max_tokens: int | None,
         is_default_question: bool = False,
+        prompts: dict[str, str] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        agent_name, system_prompt, _label = _DOMAINS[domain]
+        agent_name, _label = _DOMAINS[domain]
+        system_prompt = (prompts or default_agent_prompts())[domain]
         logger.info(
             "[agent_stream] single domain=%s document_id=%s is_default_question=%s",
             domain,
@@ -207,6 +212,7 @@ class AgentStreamService:
         temperature: float | None,
         max_tokens: int | None,
         is_default_question: bool = False,
+        prompts: dict[str, str] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         logger.info(
             "[agent_stream] multi (synthesis) document_id=%s is_default_question=%s",
@@ -216,11 +222,12 @@ class AgentStreamService:
         yield {"type": "agent", "mode": "multi"}
         started = time.perf_counter()
         budget = max_tokens or self._settings.agent_max_tokens
+        resolved = prompts or default_agent_prompts()
 
         analyses_public: list[dict[str, Any]] = []
         analyses_for_synth: list[tuple[str, str]] = []
         for domain in _MULTI_ORDER:
-            agent_name, system_prompt, label = _DOMAINS[domain]
+            agent_name, label = _DOMAINS[domain]
             yield {"type": "status", "domain": domain, "message": f"{label}…"}
             try:
                 rag = await self._generator.answer_question(
@@ -231,7 +238,7 @@ class AgentStreamService:
                     temperature=temperature,
                     max_tokens=budget,
                     document_id=document_id,
-                    system_prompt=system_prompt,
+                    system_prompt=resolved[domain],
                     is_default_question=is_default_question,
                 )
                 answer = (rag.get("answer") or "").strip()
@@ -290,7 +297,7 @@ class AgentStreamService:
             + "\n\n".join(sections)
         )
         messages = [
-            {"role": "system", "content": SYNTHESIS_SYSTEM_PROMPT},
+            {"role": "system", "content": resolved["synthesis"]},
             {"role": "user", "content": user_prompt},
         ]
 

@@ -26,6 +26,7 @@ from app.models.analysis import AnalysisStatus
 from app.models.synthesis import SYNTHESIS_VERSION, DocumentSynthesis
 from app.repositories.document import DocumentRepository
 from app.repositories.synthesis import DocumentSynthesisRepository
+from app.services.agent_prompt import AgentPromptService
 from app.services.langfuse_service import get_langfuse_service
 from app.state.graph_state import GraphState
 
@@ -208,6 +209,7 @@ class ContractSynthesisService:
             langfuse=langfuse,
             trace=trace,
         )
+        prompts = await AgentPromptService(self._session).resolve(user_id)
         initial: GraphState = {
             "user_query": _SYNTHESIS_QUESTION,
             "metadata": {
@@ -220,6 +222,7 @@ class ContractSynthesisService:
                 # Global Analysis-page synthesis: every specialist agent must
                 # see the whole contract, not a Top-K slice.
                 "is_default_question": True,
+                "agent_prompts": prompts,
             },
             "errors": [],
         }
