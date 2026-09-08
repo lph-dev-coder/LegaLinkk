@@ -9,11 +9,6 @@ from __future__ import annotations
 from typing import Literal
 
 from app.agents.legal import LEGAL_SYSTEM_PROMPT
-from app.agents.nodes.agent_prompts import (
-    COMPLIANCE_SYSTEM_PROMPT,
-    FINANCE_SYSTEM_PROMPT,
-    SYNTHESIS_SYSTEM_PROMPT,
-)
 
 AgentPromptKey = Literal["legal", "finance", "compliance", "synthesis"]
 
@@ -38,6 +33,14 @@ AGENT_PROMPT_LABELS: dict[AgentPromptKey, str] = {
 
 
 def default_agent_prompts() -> dict[AgentPromptKey, str]:
+    # Import lazily: importing a submodule first executes nodes/__init__.py,
+    # whose agent classes depend back on effective_prompt from this module.
+    from app.agents.nodes.agent_prompts import (
+        COMPLIANCE_SYSTEM_PROMPT,
+        FINANCE_SYSTEM_PROMPT,
+        SYNTHESIS_SYSTEM_PROMPT,
+    )
+
     return {
         "legal": LEGAL_SYSTEM_PROMPT,
         "finance": FINANCE_SYSTEM_PROMPT,
