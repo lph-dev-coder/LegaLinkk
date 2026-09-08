@@ -188,12 +188,27 @@ class PdfRenderError(AppError):
         super().__init__(message, status_code=500, code="pdf_render_error")
 
 
-def _blocking_url_fetcher(url: str):
-    """Allow only inline ``data:`` URIs; block all network/file access."""
-    if url.startswith("data:"):
-        from weasyprint.urls import default_url_fetcher
+@lru_cache
+def _data_only_fetcher():
+    """A WeasyPrint fetcher restricted to inline ``data:`` URIs.
 
-        return default_url_fetcher(url)
+    Report HTML comes from the LLM, so any ``http:``, ``file:`` or ``ftp:``
+    reference in it would turn PDF rendering into an SSRF / local-file-read
+    primitive. Redirects are refused for the same reason.
+    """
+    from weasyprint.urls import URLFetcher
+
+    return URLFetcher(allowed_protocols=["data"], allow_redirects=False)
+
+
+def _blocking_url_fetcher(url: str):
+    """Allow only inline ``data:`` URIs; block all network/file access.
+
+    The scheme is checked here *and* by the fetcher's protocol allowlist, so
+    neither layer alone is load-bearing.
+    """
+    if url.startswith("data:"):
+        return _data_only_fetcher()(url)
     raise ValueError(f"Blocked external resource during PDF rendering: {url[:80]}")
 
 

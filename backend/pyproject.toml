@@ -8,7 +8,8 @@ packages = [{ include = "app" }]
 
 [tool.poetry.dependencies]
 python = "^3.12"
-fastapi = "^0.115.0"
+# FastAPI >=0.141 is required to allow Starlette 1.x (see the starlette pin below).
+fastapi = "^0.141.1"
 uvicorn = { extras = ["standard"], version = "^0.32.0" }
 sqlalchemy = { extras = ["asyncio"], version = "^2.0.36" }
 asyncpg = "^0.30.0"
@@ -17,24 +18,45 @@ alembic = "^1.14.0"
 pydantic = "^2.10.0"
 pydantic-settings = "^2.6.0"
 python-dotenv = "^1.0.1"
-python-multipart = "^0.0.17"
+# Multipart parser DoS / boundary-handling advisories (CVE-2024-53981,
+# CVE-2026-24486, CVE-2026-42561, CVE-2026-53537..40): fixed in 0.0.31.
+python-multipart = ">=0.0.32,<0.1.0"
 aiofiles = "^24.1.0"
 pymupdf = "^1.25.0"
 numpy = "^2.0.0"
 paddlepaddle = "^3.0.0"
 paddleocr = "^2.9.1"
 pgvector = "^0.3.6"
-fastembed = "^0.6.0"
+# fastembed 0.6.x caps pillow at <12.0, which blocks the pillow security floor
+# below; 0.8.x allows pillow <13.0. Same TextEmbedding / TextCrossEncoder API.
+fastembed = "^0.8.0"
 httpx = "^0.28.0"
-langgraph = "^0.3.34"
+# LangGraph 1.x transitively pins langchain-core >=1.4.7, langgraph-checkpoint
+# >=4.1.0 and langgraph-sdk >=0.4.2, which clears the deserialisation / RCE
+# advisories against the 0.3.x line (CVE-2025-68664, CVE-2025-64439,
+# CVE-2026-44843, CVE-2026-28277 and related).
+langgraph = "^1.2.11"
 langfuse = "^3.0.0"
 celery = { extras = ["redis"], version = "^5.4.0" }
 redis = "^5.2.0"
-weasyprint = "^63.0"
+weasyprint = "^69.0"
+
+# --- Transitive dependencies pinned for security ---------------------------
+# Not imported directly, but pulled in by fastapi / paddleocr / weasyprint with
+# ranges loose enough to resolve to a vulnerable release. Floors are declared
+# here so the lockfile cannot drift back below the patched versions.
+#
+# Starlette: multipart and redirect handling advisories up to CVE-2026-54283.
+starlette = ">=1.6.0,<2.0.0"
+# Pillow: image/font parser out-of-bounds writes and decompression bombs
+# reachable from user-uploaded PDFs during OCR rendering.
+pillow = "^12.3.0"
 
 [tool.poetry.group.dev.dependencies]
-pytest = "^8.3.0"
-pytest-asyncio = "^0.24.0"
+# pytest >=9.0.3 fixes the insecure tmpdir handling in CVE-2025-71176;
+# pytest-asyncio 1.x is the first line that supports pytest 9.
+pytest = "^9.1.1"
+pytest-asyncio = "^1.4.0"
 ruff = "^0.8.0"
 
 [tool.pytest.ini_options]

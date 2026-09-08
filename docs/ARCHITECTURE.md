@@ -8,7 +8,7 @@
 > services, endpoints, graphs/nodes, agents, frontend routes/pages, infra services, or data
 > flows). See `.cursor/rules/keep-architecture-doc-updated.mdc`.
 >
-> _Last verified: 2026-08-26 (per-user specialist agent system prompts are editable in Settings; hardcoded strings remain the defaults)._
+> _Last verified: 2026-09-08 (security remediation pass: credentials removed from source, CORS allowlist, JWT header pinning, non-root container, dependency upgrades incl. LangGraph 1.x)._
 
 ---
 
@@ -45,6 +45,16 @@ classic layered system with an asynchronous processing plane.
 | `backend` | `uvicorn app.main:app` | FastAPI HTTP API (ASGI) |
 | `worker` | `celery -A app.core.celery_app:celery_app worker` | Background ingestion, chat/agent generation and contract analysis |
 | `frontend` (dev) | `vite` | React SPA, proxies `/api` → backend:8000 |
+
+**Container hardening:** the backend image creates an unprivileged `appuser` (UID/GID 10001) and
+ends with `USER 10001:10001`; only `/app/storage` and `$HOME/.cache` are writable by the app, so
+application code cannot rewrite itself. The FastEmbed/reranker model cache moved from
+`/root/.cache/fastembed` to `/home/appuser/.cache/fastembed` (the `embedding_cache` volume mounts
+there, and `Settings` expands a leading `~`). `backend` and `worker` run with
+`security_opt: no-new-privileges:true`. `POSTGRES_PASSWORD` is a **required** variable in both
+`docker-compose.yml` (`${POSTGRES_PASSWORD:?…}`) and `Settings` — there is no default anywhere, so
+compose refuses to start rather than silently deploying a known password. Copy `.env.example` →
+`.env` at the repo root and keep the value in sync with `backend/.env`.
 
 **Layering (backend):** Routers → Services → Repositories → SQLAlchemy Models →
 PostgreSQL/pgvector. Long-running AI orchestration is expressed as **LangGraph `StateGraph`**
@@ -260,12 +270,24 @@ All SQL lives in `repositories/`:
 - **Routers** (`app/api/v1/endpoints/`): thin — parse request, call one service, return a schema.
 - **Models** (`app/models/`): ORM only (see §4).
 - **Schemas** (`app/schemas/`): Pydantic v2 DTOs (`from_attributes=True` where mapping ORM).
-- **Configuration:** `Settings` (pydantic-settings) loads env/`.env`; exposes computed
-  `database_url` (asyncpg) and `database_url_sync` (psycopg2 for Alembic). Completion budgets are
+- **Configuration:** `Settings` (pydantic-settings) loads env/`.env`; exposes `database_url`
+  (asyncpg) and `database_url_sync` (psycopg2 for Alembic). Completion budgets are
   intentionally separate: `LLM_MAX_TOKENS` for concise chat, `AGENT_MAX_TOKENS` (8192) for detailed
   specialist analyses, and `DOCUMENT_MAX_TOKENS` (16000 plus continuation rounds) for reports.
-- **Middleware:** only `CORSMiddleware` (open in development) + a global `AppError` exception
-  handler. No custom auth middleware — auth is a router-level dependency.
+- **Credential handling (`core/config.py`):** `postgres_password` and `jwt_secret` are `SecretStr`
+  with **no usable default** — neither value exists in source. A `model_validator(mode="after")`
+  fails closed: a missing `POSTGRES_PASSWORD` always aborts startup, and a `JWT_SECRET` that is
+  absent, a known placeholder, or shorter than 32 characters aborts startup outside development.
+  In development a random per-process secret is generated instead (logged as a warning; tokens do
+  not survive a restart until `JWT_SECRET` is set). The DSN builders percent-encode user and
+  password, and `database_url`/`database_url_sync` are plain properties rather than
+  `computed_field`s so `model_dump()` cannot leak the password.
+- **Middleware:** only `CORSMiddleware` + a global `AppError` exception handler. No custom auth
+  middleware — auth is a router-level dependency. CORS uses an **exact-origin allowlist**
+  (`CORS_ALLOW_ORIGINS`, comma-separated); it is never `"*"`, because a wildcard combined with
+  `allow_credentials=True` makes Starlette reflect any caller's `Origin`. With nothing configured,
+  development falls back to the local Vite origins (`5173`/`4173`) and production allows none.
+  Methods and headers are enumerated instead of wildcarded.
 - **Utilities:** `utils/storage.py` (`DocumentStorage` — async file save/delete, `is_pdf_content`
   magic-byte check).
 
@@ -578,7 +600,8 @@ Shared state helpers in `_state_utils.py`.
 - All three graphs share a **transient-only** retry policy (`app/graphs/retry.py::transient_retry_policy`,
   3 attempts). It retries only recoverable failures (timeouts, 429, 5xx, `AppError.retryable`,
   network blips) and fails fast on permanent errors (validation, not-found, auth/config) so retries
-  are never wasted. Falls back to attempt-count-only on older LangGraph versions.
+  are never wasted. It is attached with LangGraph 1.x's `add_node(..., retry_policy=…)` keyword
+  (the old `retry=` alias is deprecated).
 - Ingestion graph applies the shared policy on parse/ocr/embedding/persist/indexing; conditional
   routing via `ExtractionPipeline.is_scanned_pdf`; `PdfParseError` → OCR fallback; `IndexingError`
   tolerated (document stays *processed*); optional `on_stage` callback publishes progress to Redis.
@@ -1259,8 +1282,44 @@ React component polls.
 - ✓ Contract analysis is a reconnectable Celery job with owner-scoped Redis status/result storage;
   browser navigation and refresh do not cancel generation.
 
+**Security remediation pass (2026-09-08)**
+- ✓ No credentials in source: `POSTGRES_PASSWORD` and `JWT_SECRET` are `SecretStr` with no
+  default and are validated fail-closed at startup (see §3). `docker-compose.yml` no longer
+  carries a fallback database password.
+- ✓ CORS is an exact-origin allowlist; the `"*" + allow_credentials` origin-reflection issue is
+  gone (see §3).
+- ✓ JWT verification pins the header `alg` to the configured algorithm before checking the
+  signature, so `alg: none` and algorithm-downgrade tokens are rejected; the payload must be a
+  JSON object with a valid integer `exp`; oversized tokens are dropped early; and caller-supplied
+  `extra_claims` can no longer overwrite `sub`/`iat`/`exp`. `JWT_ALGORITHM` is constrained to
+  `HS256|HS384|HS512`.
+- ✓ OCR subprocess least privilege (`ocr/subprocess_runner.py`): the child process receives an
+  **allowlisted** environment (PATH/HOME/cache/thread + `FLAGS_*`/`PADDLE_*` only) instead of the
+  full parent environment, so the database password and LLM/Langfuse keys never reach it. The
+  language code is validated against a strict pattern, the input path is resolved and confirmed to
+  be a regular file, and it is passed after `--` so a filename cannot be parsed as an option.
+- ✓ PDF rendering keeps its `data:`-only fetcher, now built on WeasyPrint's
+  `URLFetcher(allowed_protocols=["data"], allow_redirects=False)` instead of the deprecated
+  `default_url_fetcher`, so LLM-authored report HTML cannot reach `http:`/`file:` URLs.
+- ✓ Container runs as non-root with `no-new-privileges` (see §1).
+- ✓ Dependency upgrades clearing all reported CVEs: LangGraph `0.3.34 → 1.2.11` (pulls
+  langchain-core `1.6.2`, langgraph-checkpoint `4.2.0`, langgraph-sdk `0.4.4`), FastAPI
+  `0.115 → 0.141.1` + Starlette `0.46.2 → 1.6.0`, Pillow `11.3.0 → 12.3.0` (needs FastEmbed
+  `0.6 → 0.8`, which lifts the `pillow<12` cap), python-multipart `0.0.17 → 0.0.32`, WeasyPrint
+  `63.1 → 69.0`, pytest `8.4.2 → 9.1.1` with pytest-asyncio `0.24 → 1.4`; frontend
+  react-router-dom `7.11 → 7.18.3`, Vite `8.1 → 8.2.2`, plus `overrides` pinning postcss
+  `≥8.5.28` and nanoid `≥3.3.18` (both transitive via Vite).
+- ✓ `tests/test_security_config.py` locks in these invariants (29 tests: credential validation,
+  DSN encoding, non-serialisation of the password, CORS scope, JWT round-trip/forgery/downgrade/
+  expiry/malformed input, password hashing).
+- ✓ The image installs Poetry 2.2.1, which natively reads `poetry.lock`'s `lock-version = 2.1`.
+  Poetry 1.8.5 only warned and guessed, so the build could have silently installed something
+  other than the pinned patched versions.
+- ⚠ **Residual, not reachable:** CVE-2026-49452 (WeasyPrint CSS injection via *presentational
+  hints*) has no fixed release. It does not apply here: `presentational_hints` defaults to
+  `False` and `render_html_to_pdf` never enables it. Re-evaluate if that flag is ever turned on.
+
 **Technical debt**
-- Default `JWT_SECRET` in config must be overridden in production; CORS is fully open in dev.
 - Stale docstrings ("future"/"architecture preparation") on live components (`GraphState`,
   `BaseGraphAgent`).
 - Denormalized `chunk_embeddings` (filename/chunk_text duplicated) — intentional for retrieval

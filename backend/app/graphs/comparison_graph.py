@@ -41,7 +41,7 @@ def build_comparison_graph(
     builder.add_node(
         "compare_contracts",
         compare_step,
-        retry=transient_retry_policy(3),
+        retry_policy=transient_retry_policy(3),
     )
     builder.set_entry_point("compare_contracts")
     builder.add_edge("compare_contracts", END)

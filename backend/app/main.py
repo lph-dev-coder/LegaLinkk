@@ -51,12 +51,22 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    # "*" combined with allow_credentials makes Starlette reflect whatever
+    # Origin the caller sends, which lets any site read authenticated responses.
+    # Always send an explicit allowlist instead (see Settings.cors_allow_origins).
+    allowed_origins = settings.cors_allow_origin_list
+    if not allowed_origins:
+        logger.warning(
+            "No CORS origins configured — browser clients on other origins will be "
+            "blocked. Set CORS_ALLOW_ORIGINS to a comma-separated list of origins."
+        )
     application.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"] if settings.is_development else [],
+        allow_origins=allowed_origins,
         allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "Accept", "X-Requested-With"],
+        max_age=600,
     )
 
     @application.exception_handler(AppError)

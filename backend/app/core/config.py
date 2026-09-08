@@ -1,9 +1,38 @@
 """Application configuration loaded from environment variables."""
 
+import logging
+import secrets
 from functools import lru_cache
+from pathlib import Path
+from typing import Literal
+from urllib.parse import quote
 
-from pydantic import computed_field
+from pydantic import SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
+
+# Environment names that enable developer conveniences (ephemeral JWT secret,
+# permissive CORS). Anything else is treated as production and fails closed.
+_DEVELOPMENT_ENVIRONMENTS = {"development", "dev", "local"}
+
+# An HS256 key shorter than the HMAC block size is brute-forceable offline once
+# a single token leaks, so refuse anything below 32 characters.
+_MIN_JWT_SECRET_LENGTH = 32
+
+# Values that have shipped as documentation placeholders and must never be
+# accepted as a real secret, even if they are long enough.
+_REJECTED_SECRETS = frozenset(
+    {
+        "change-me",
+        "changeme",
+        "change-me-in-production",
+        "change-me-in-production-please-use-a-long-random-secret",
+        "secret",
+        "changethis",
+        "please-change-me",
+    }
+)
 
 
 class Settings(BaseSettings):
@@ -31,9 +60,17 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
 
-    # Database
+    # CORS: comma-separated exact origins (scheme + host + port), e.g.
+    # "https://app.example.com,https://admin.example.com". Credentialed
+    # requests are only enabled when an explicit allowlist is configured,
+    # because "*" plus cookies is both spec-invalid and origin-reflecting.
+    cors_allow_origins: str = ""
+
+    # Database. The password has no default on purpose: a fallback baked into
+    # source is a hard-coded credential (CWE-798) and silently becomes the
+    # production password whenever POSTGRES_PASSWORD is forgotten.
     postgres_user: str = "legallink"
-    postgres_password: str = "legallink"
+    postgres_password: SecretStr = SecretStr("")
     postgres_host: str = "localhost"
     postgres_port: int = 5432
     postgres_db: str = "legallink"
@@ -67,7 +104,7 @@ class Settings(BaseSettings):
     embedding_fallback_model: str = "intfloat/multilingual-e5-large"
     embedding_dimension: int = 1024
     embedding_batch_size: int = 2
-    embedding_cache_dir: str = "/root/.cache/fastembed"
+    embedding_cache_dir: str = "~/.cache/fastembed"
     auto_index_on_process: bool = True
 
     # Semantic retrieval (pgvector cosine Top-K)
@@ -79,7 +116,7 @@ class Settings(BaseSettings):
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
     reranker_fallback_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     reranker_final_k: int = 5
-    reranker_cache_dir: str = "/root/.cache/fastembed"
+    reranker_cache_dir: str = "~/.cache/fastembed"
 
     # Library-wide ("all documents") retrieval coverage. When no single document
     # is selected, plain Top-K concentrates on whichever document has the most
@@ -169,9 +206,12 @@ class Settings(BaseSettings):
     # TTL for reconnectable chat/agent jobs and their streamed event history.
     chat_job_ttl_seconds: int = 60 * 60 * 24  # 24h
 
-    # Authentication (JWT)
-    jwt_secret: str = "change-me-in-production-please-use-a-long-random-secret"
-    jwt_algorithm: str = "HS256"
+    # Authentication (JWT). JWT_SECRET must come from the environment. Outside
+    # development a missing or placeholder value aborts startup; in development
+    # a random per-process secret is generated so tokens are never signed with
+    # a key an attacker can read in the repository.
+    jwt_secret: SecretStr = SecretStr("")
+    jwt_algorithm: Literal["HS256", "HS384", "HS512"] = "HS256"
     access_token_expire_minutes: int = 60 * 24  # 24h
 
     # Observability — Langfuse tracing (optional; disabled by default).
@@ -188,6 +228,65 @@ class Settings(BaseSettings):
     # of compact size/preview summaries. Off by default for confidentiality.
     langfuse_capture_full_io: bool = False
 
+    @model_validator(mode="after")
+    def _expand_cache_paths(self) -> "Settings":
+        """Resolve ``~`` in cache directories.
+
+        The model caches used to be pinned to ``/root/.cache``, which is not
+        writable now that the container runs as an unprivileged user. Consumers
+        hand these straight to fastembed, which does not expand ``~`` itself.
+        """
+        self.embedding_cache_dir = str(Path(self.embedding_cache_dir).expanduser())
+        self.reranker_cache_dir = str(Path(self.reranker_cache_dir).expanduser())
+        return self
+
+    @model_validator(mode="after")
+    def _enforce_secret_hygiene(self) -> "Settings":
+        """Reject missing/placeholder credentials before the app can serve traffic."""
+        password = self.postgres_password.get_secret_value()
+        if not password:
+            raise ValueError(
+                "POSTGRES_PASSWORD is not set. Configure it in the environment "
+                "(see backend/.env.example) — there is no built-in default."
+            )
+
+        secret = self.jwt_secret.get_secret_value()
+        if secret.strip().lower() in _REJECTED_SECRETS or len(secret) < _MIN_JWT_SECRET_LENGTH:
+            if not self.is_development:
+                raise ValueError(
+                    "JWT_SECRET is missing, a known placeholder, or shorter than "
+                    f"{_MIN_JWT_SECRET_LENGTH} characters. Generate one with "
+                    "`python -c \"import secrets; print(secrets.token_urlsafe(48))\"` "
+                    "and set JWT_SECRET in the environment."
+                )
+            self.jwt_secret = SecretStr(secrets.token_urlsafe(48))
+            logger.warning(
+                "JWT_SECRET is unset or too weak; generated an ephemeral development "
+                "secret. Every restart invalidates all issued tokens — set JWT_SECRET "
+                "in backend/.env to keep sessions stable."
+            )
+
+        return self
+
+    @property
+    def cors_allow_origin_list(self) -> list[str]:
+        """Exact origins allowed by CORS, in priority order of configuration.
+
+        An explicit allowlist always wins. With nothing configured, development
+        falls back to the local Vite dev servers and production allows nothing.
+        """
+        configured = [item.strip() for item in self.cors_allow_origins.split(",") if item.strip()]
+        if configured:
+            return configured
+        if self.is_development:
+            return [
+                "http://localhost:5173",
+                "http://127.0.0.1:5173",
+                "http://localhost:4173",
+                "http://127.0.0.1:4173",
+            ]
+        return []
+
     @property
     def max_upload_size_bytes(self) -> int:
         return self.max_upload_size_mb * 1024 * 1024
@@ -196,27 +295,36 @@ class Settings(BaseSettings):
     def allowed_mime_type_set(self) -> set[str]:
         return {item.strip() for item in self.allowed_mime_types.split(",") if item.strip()}
 
-    @computed_field  # type: ignore[prop-decorator]
+    def _database_url(self, driver: str) -> str:
+        """Build a DSN with percent-encoded credentials.
+
+        Encoding matters for correctness and safety: an unescaped ``@``, ``/``
+        or ``#`` in a strong password would otherwise reshape the URL and point
+        the client at a different host or database.
+        """
+        user = quote(self.postgres_user, safe="")
+        password = quote(self.postgres_password.get_secret_value(), safe="")
+        return (
+            f"postgresql+{driver}://{user}:{password}"
+            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
+        )
+
+    # Plain properties rather than computed fields: a computed field is emitted
+    # by model_dump()/model_dump_json(), which would print the password anywhere
+    # settings get serialised for debugging.
     @property
     def database_url(self) -> str:
         """Async SQLAlchemy connection URL (asyncpg)."""
-        return (
-            f"postgresql+asyncpg://{self.postgres_user}:{self.postgres_password}"
-            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
-        )
+        return self._database_url("asyncpg")
 
-    @computed_field  # type: ignore[prop-decorator]
     @property
     def database_url_sync(self) -> str:
         """Sync SQLAlchemy connection URL (psycopg2) used by Alembic."""
-        return (
-            f"postgresql+psycopg2://{self.postgres_user}:{self.postgres_password}"
-            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
-        )
+        return self._database_url("psycopg2")
 
     @property
     def is_development(self) -> bool:
-        return self.app_env.lower() in {"development", "dev", "local"}
+        return self.app_env.lower() in _DEVELOPMENT_ENVIRONMENTS
 
     @property
     def effective_celery_broker_url(self) -> str:

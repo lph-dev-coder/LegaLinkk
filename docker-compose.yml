@@ -5,7 +5,10 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-legallink}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-legallink}
+      # No default: a fallback password here becomes the real one whenever the
+      # variable is forgotten. Set POSTGRES_PASSWORD in the root .env
+      # (see .env.example) — it must match backend/.env.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set (see .env.example)}
       POSTGRES_DB: ${POSTGRES_DB:-legallink}
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
@@ -40,14 +43,25 @@ services:
       dockerfile: Dockerfile
     container_name: legallink-backend
     restart: unless-stopped
+    # The image already drops to an unprivileged user; block setuid binaries
+    # from re-escalating inside the container.
+    security_opt:
+      - no-new-privileges:true
     env_file:
       - ./backend/.env
     environment:
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
+      # Taken from the root .env, exactly like the `db` service above, so the
+      # app and the database can never be pointed at different credentials.
+      # These override anything in backend/.env for compose runs.
+      POSTGRES_USER: ${POSTGRES_USER:-legallink}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set (see .env.example)}
+      POSTGRES_DB: ${POSTGRES_DB:-legallink}
       REDIS_URL: redis://redis:6379/0
       BRAND_LOGO_PATH: /brand/logo.png
-      EMBEDDING_CACHE_DIR: /root/.cache/fastembed
+      EMBEDDING_CACHE_DIR: /home/appuser/.cache/fastembed
+      RERANKER_CACHE_DIR: /home/appuser/.cache/fastembed
       # Low-RAM runtime knobs (override .env if needed)
       OMP_NUM_THREADS: "1"
       MKL_NUM_THREADS: "1"
@@ -67,7 +81,7 @@ services:
     volumes:
       - ./backend:/app
       - ./frontend/public/logo.png:/brand/logo.png:ro
-      - embedding_cache:/root/.cache/fastembed
+      - embedding_cache:/home/appuser/.cache/fastembed
     # No --reload: reload doubles process memory and is unstable under RAM pressure.
     command: >
       uvicorn app.main:app
@@ -83,14 +97,20 @@ services:
       dockerfile: Dockerfile
     container_name: legallink-worker
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     env_file:
       - ./backend/.env
     environment:
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-legallink}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set (see .env.example)}
+      POSTGRES_DB: ${POSTGRES_DB:-legallink}
       REDIS_URL: redis://redis:6379/0
       BRAND_LOGO_PATH: /brand/logo.png
-      EMBEDDING_CACHE_DIR: /root/.cache/fastembed
+      EMBEDDING_CACHE_DIR: /home/appuser/.cache/fastembed
+      RERANKER_CACHE_DIR: /home/appuser/.cache/fastembed
       OMP_NUM_THREADS: "1"
       MKL_NUM_THREADS: "1"
       OPENBLAS_NUM_THREADS: "1"
@@ -107,7 +127,7 @@ services:
     volumes:
       - ./backend:/app
       - ./frontend/public/logo.png:/brand/logo.png:ro
-      - embedding_cache:/root/.cache/fastembed
+      - embedding_cache:/home/appuser/.cache/fastembed
     # Single worker/concurrency=1 keeps memory bounded on low-RAM hosts.
     command: >
       celery -A app.core.celery_app:celery_app worker

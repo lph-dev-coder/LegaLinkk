@@ -162,10 +162,10 @@ def build_multi_agent_graph(
 
     builder = StateGraph(GraphState)
     builder.add_node("command_parser", command_parser_step)
-    builder.add_node("legal", legal_step, retry=retry)
-    builder.add_node("finance", finance_step, retry=retry)
-    builder.add_node("compliance", compliance_step, retry=retry)
-    builder.add_node("synthesis", synthesis_step, retry=retry)
+    builder.add_node("legal", legal_step, retry_policy=retry)
+    builder.add_node("finance", finance_step, retry_policy=retry)
+    builder.add_node("compliance", compliance_step, retry_policy=retry)
+    builder.add_node("synthesis", synthesis_step, retry_policy=retry)
 
     builder.set_entry_point("command_parser")
     builder.add_conditional_edges(

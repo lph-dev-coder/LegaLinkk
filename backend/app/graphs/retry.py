@@ -10,9 +10,6 @@ from __future__ import annotations
 from langgraph.types import RetryPolicy
 
 from app.core.exceptions import AppError
-from app.core.logging import get_logger
-
-logger = get_logger(__name__)
 
 # Error codes that are never worth retrying (deterministic client/config errors).
 _NON_RETRYABLE_CODES = {
@@ -37,13 +34,5 @@ def is_transient_error(exc: Exception) -> bool:
 
 
 def transient_retry_policy(max_attempts: int = 3) -> RetryPolicy:
-    """Build a RetryPolicy that only retries transient errors.
-
-    Falls back to a plain attempt-count policy on older LangGraph versions that
-    do not support the ``retry_on`` predicate.
-    """
-    try:
-        return RetryPolicy(max_attempts=max_attempts, retry_on=is_transient_error)
-    except TypeError:  # pragma: no cover - depends on installed langgraph version
-        logger.debug("LangGraph RetryPolicy lacks retry_on; using attempt count only")
-        return RetryPolicy(max_attempts=max_attempts)
+    """Build a RetryPolicy that only retries transient errors."""
+    return RetryPolicy(max_attempts=max_attempts, retry_on=is_transient_error)

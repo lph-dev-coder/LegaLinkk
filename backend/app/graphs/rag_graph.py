@@ -118,10 +118,10 @@ def build_rag_graph(
         return await _run_node(generator_node, state, langfuse=langfuse, parent=trace)
 
     builder = StateGraph(GraphState)
-    builder.add_node("embedding", embedding_step, retry=retry)
-    builder.add_node("retrieval", retrieval_step, retry=retry)
-    builder.add_node("reranker", reranker_step, retry=retry)
-    builder.add_node("generator", generator_step, retry=retry)
+    builder.add_node("embedding", embedding_step, retry_policy=retry)
+    builder.add_node("retrieval", retrieval_step, retry_policy=retry)
+    builder.add_node("reranker", reranker_step, retry_policy=retry)
+    builder.add_node("generator", generator_step, retry_policy=retry)
 
     builder.set_entry_point("embedding")
     builder.add_edge("embedding", "retrieval")

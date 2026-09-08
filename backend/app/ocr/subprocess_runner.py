@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -13,6 +14,86 @@ from app.core.logging import get_logger
 from app.ocr import OcrDocumentResult, OcrError, OcrPageResult
 
 logger = get_logger(__name__)
+
+# PaddleOCR language codes are plain identifiers ("en", "french", "ch_tra").
+# Anything else is rejected rather than forwarded to the child process.
+_LANG_PATTERN = re.compile(r"\A[A-Za-z][A-Za-z0-9_]{0,31}\Z")
+
+# The OCR worker only needs to find Python, write to its cache/temp dirs and
+# obey the single-thread math limits. Everything else — database password, LLM
+# and Langfuse API keys — is withheld, so the child process cannot leak them
+# through a crash dump, its own subprocesses, or /proc/<pid>/environ.
+_ENV_ALLOWLIST = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TZ",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONUNBUFFERED",
+        "PYTHONDONTWRITEBYTECODE",
+        "XDG_CACHE_HOME",
+        "HF_HOME",
+        "NUMEXPR_NUM_THREADS",
+        # Windows needs these for the interpreter and DLL loader to start.
+        "SYSTEMROOT",
+        "SYSTEMDRIVE",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "PROCESSOR_ARCHITECTURE",
+        "NUMBER_OF_PROCESSORS",
+        # The first OCR run downloads Paddle models.
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+    }
+)
+
+# Paddle reads its own tuning knobs from FLAGS_* and PADDLE_* variables.
+_ENV_ALLOWED_PREFIXES = ("FLAGS_", "PADDLE_")
+
+
+def _build_worker_env() -> dict[str, str]:
+    """Return a minimal environment for the OCR child process."""
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key in _ENV_ALLOWLIST or key.startswith(_ENV_ALLOWED_PREFIXES)
+    }
+    # Single-threaded math keeps peak RAM bounded on small hosts.
+    env.update(
+        {
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "FLAGS_use_mkldnn": "0",
+        }
+    )
+    return env
+
+
+def _resolve_input_path(file_path: str) -> Path:
+    """Validate ``file_path`` before it becomes a command-line argument."""
+    try:
+        resolved = Path(file_path).resolve(strict=True)
+    except OSError as exc:
+        raise OcrError(f"OCR input file is not readable: {file_path}") from exc
+    if not resolved.is_file():
+        raise OcrError(f"OCR input path is not a regular file: {file_path}")
+    return resolved
 
 
 def _parse_worker_stdout(stdout: str) -> dict:
@@ -66,22 +147,30 @@ def run_paddle_ocr_subprocess(
     max_image_side: int = 1280,
 ) -> OcrDocumentResult:
     """Execute OCR in a child process and return structured results."""
+    if not _LANG_PATTERN.match(lang):
+        raise OcrError(f"Unsupported OCR language code: {lang!r}")
+    resolved_path = _resolve_input_path(file_path)
+
     with tempfile.TemporaryDirectory(prefix="legallink-ocr-") as tmp_dir:
         output_json = Path(tmp_dir) / "result.json"
+        # Fixed argv (no shell), an interpreter path we own, and validated
+        # numeric/enum options. The positional input path goes after "--" so a
+        # filename beginning with "-" can never be parsed as an option.
         cmd = [
             sys.executable,
             "-m",
             "app.ocr.paddle_ocr_worker",
-            file_path,
             "--lang",
             lang,
             "--scale",
-            str(scale),
+            str(float(scale)),
             "--max-image-side",
-            str(max_image_side),
+            str(int(max_image_side)),
             "--use-angle-cls" if use_angle_cls else "--no-use-angle-cls",
             "--output-json",
             str(output_json),
+            "--",
+            str(resolved_path),
         ]
         logger.info(
             "Starting isolated OCR subprocess for %s "
@@ -95,19 +184,14 @@ def run_paddle_ocr_subprocess(
         )
 
         try:
-            completed = subprocess.run(
+            completed = subprocess.run(  # noqa: S603  # fixed argv, shell=False, validated args
                 cmd,
                 capture_output=True,
                 text=True,
                 timeout=timeout_seconds,
                 check=False,
-                env={
-                    **os.environ,
-                    "OMP_NUM_THREADS": "1",
-                    "MKL_NUM_THREADS": "1",
-                    "OPENBLAS_NUM_THREADS": "1",
-                    "FLAGS_use_mkldnn": "0",
-                },
+                shell=False,
+                env=_build_worker_env(),
             )
         except subprocess.TimeoutExpired as exc:
             logger.error(

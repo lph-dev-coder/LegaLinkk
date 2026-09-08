@@ -235,13 +235,13 @@ def build_ingestion_graph(
             return state
 
     builder = StateGraph(GraphState)
-    builder.add_node("parser", parser_step, retry=retry)
-    builder.add_node("ocr", ocr_step, retry=retry)
+    builder.add_node("parser", parser_step, retry_policy=retry)
+    builder.add_node("ocr", ocr_step, retry_policy=retry)
     builder.add_node("cleaning", cleaning_step)
     builder.add_node("chunking", chunking_step)
-    builder.add_node("embedding", embedding_step, retry=retry)
-    builder.add_node("persist", persist_step, retry=retry)
-    builder.add_node("indexing", indexing_step, retry=retry)
+    builder.add_node("embedding", embedding_step, retry_policy=retry)
+    builder.add_node("persist", persist_step, retry_policy=retry)
+    builder.add_node("indexing", indexing_step, retry_policy=retry)
 
     builder.set_entry_point("parser")
     builder.add_conditional_edges(
